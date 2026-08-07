@@ -4,7 +4,27 @@ import { notFound } from "next/navigation";
 import type { UTCTimestamp } from "lightweight-charts";
 import { PriceChart, type ChartPoint } from "@/components/price-chart";
 import { Card, CardLabel, CardValue } from "@/components/ui/card";
-import { formatCoins, getAsset, getMarkets, getPrices, type PricePoint } from "@/lib/api";
+import {
+  ApiError,
+  formatCoins,
+  getAsset,
+  getMarkets,
+  getPrices,
+  type PricePoint,
+} from "@/lib/api";
+
+/**
+ * Null for "the API says this does not exist", rethrow for everything else.
+ *
+ * A 400 is here because a malformed id never reaches the handler: axum rejects
+ * the path before it runs, which is the same answer as not found.
+ */
+function missingOrRethrow(error: unknown): null {
+  if (error instanceof ApiError && (error.status === 404 || error.status === 400)) {
+    return null;
+  }
+  throw error;
+}
 
 export default async function AssetPage({
   params,
@@ -20,12 +40,14 @@ export default async function AssetPage({
   const requested = (await searchParams).market;
   const market = markets.find((m) => m.id === requested) ?? markets[0];
 
-  // Both calls are guarded, not just the first. A bad id makes the API reject
-  // BOTH, and an uncaught rejection here replaced the 404 with Next's generic
-  // "application error" page.
+  // Only a 404 or a rejected id means the card is missing. Catching everything
+  // mapped a database outage to "this asset does not exist", which is the one
+  // answer that is certainly wrong, and it did it on every asset page at once.
+  // Anything else is rethrown into the error boundary, which says the API is
+  // unreachable rather than inventing a verdict.
   const [asset, prices] = await Promise.all([
-    getAsset(id).catch(() => null),
-    getPrices(id, market.id).catch(() => null),
+    getAsset(id).catch(missingOrRethrow),
+    getPrices(id, market.id).catch(missingOrRethrow),
   ]);
   if (!asset) notFound();
 
