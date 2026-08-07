@@ -18,6 +18,14 @@ pub struct Config {
     pub daily_request_budget: u32,
     pub http_timeout: Duration,
     pub min_free_disk_bytes: u64,
+    /// Which filesystem the disk check measures.
+    ///
+    /// Section 4.9 means the DATA volume: compression needs room for a
+    /// compressed copy before it drops the original, and a full volume stops
+    /// PostgreSQL. Once the server runs in its own container, its working
+    /// directory is a different filesystem from the database's, so the default
+    /// of "." measures the wrong thing and must be pointed at the data volume.
+    pub disk_check_path: String,
     /// Optional so that tests and local development need no external service.
     pub heartbeat_url: Option<String>,
     pub api_row_cap: i64,
@@ -55,6 +63,7 @@ impl Config {
             daily_request_budget: num("DAILY_REQUEST_BUDGET", 18_000)?,
             http_timeout: Duration::from_secs(num("HTTP_TIMEOUT_SECONDS", 30)?),
             min_free_disk_bytes: num("MIN_FREE_DISK_BYTES", 5 * 1024 * 1024 * 1024)?,
+            disk_check_path: opt("DISK_CHECK_PATH", "."),
             heartbeat_url: std::env::var("HEARTBEAT_URL")
                 .ok()
                 .filter(|s| !s.is_empty()),
