@@ -1,0 +1,222 @@
+use crate::config::Config;
+use crate::db;
+use crate::ids::MarketId;
+use crate::valuation;
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::get,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub config: Config,
+}
+
+pub fn router(pool: PgPool, config: Config) -> Router {
+    let state = AppState { pool, config };
+    Router::new()
+        .route("/health", get(health))
+        .route("/assets", get(list_assets))
+        .route("/assets/{id}", get(get_asset))
+        .route("/assets/{id}/prices", get(asset_prices))
+        .route("/markets/{id}/valuations", get(valuations))
+        .with_state(state)
+}
+
+#[derive(Serialize)]
+struct Health {
+    ok: bool,
+    reasons: Vec<String>,
+}
+
+/// Returns 503 only when the ledger has stopped.
+///
+/// It reads the poll table, never the observation table. The observation table
+/// records changes only, so a market where nothing moves writes nothing and
+/// would look identical to an outage.
+///
+/// A missing price CHANGE is never a failure condition here. A card that holds
+/// its price is normal, and a check that treats it as a fault sits red on a
+/// healthy system until somebody stops reading it.
+async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
+    let mut reasons = Vec::new();
+
+    match db::newest_poll_age_seconds(&s.pool).await {
+        Err(e) => reasons.push(format!("cannot read poll history: {e}")),
+        Ok(None) => {} // Nothing polled yet. A fresh install is not a fault.
+        Ok(Some(age)) => {
+            let limit = db::largest_poll_interval_seconds(&s.pool).await.unwrap_or(14_400);
+            if age > f64::from(limit) {
+                reasons.push(format!("no poll for {age:.0}s, limit {limit}s"));
+            }
+        }
+    }
+
+    if let Some(free) = free_disk_bytes(".")
+        && free < s.config.min_free_disk_bytes
+    {
+        // Compression needs room for a compressed copy before it drops the
+        // original, and a full volume stops PostgreSQL outright.
+        reasons.push(format!("free disk {free} below {}", s.config.min_free_disk_bytes));
+    }
+
+    let ok = reasons.is_empty();
+    let code = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (code, Json(Health { ok, reasons }))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct Asset {
+    id: Uuid,
+    name: String,
+    rating: Option<i16>,
+    rarity: String,
+    version: String,
+    position: Option<String>,
+}
+
+async fn list_assets(State(s): State<AppState>) -> Result<Json<Vec<Asset>>, ApiError> {
+    let rows = sqlx::query_as::<_, Asset>(
+        "SELECT id, name, rating, rarity, version, position FROM assets ORDER BY rating DESC NULLS LAST, name",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    Ok(Json(rows))
+}
+
+async fn get_asset(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Asset>, ApiError> {
+    sqlx::query_as::<_, Asset>(
+        "SELECT id, name, rating, rarity, version, position FROM assets WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&s.pool)
+    .await?
+    .map(Json)
+    .ok_or(ApiError::NotFound)
+}
+
+#[derive(Deserialize)]
+struct Range {
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct PricePoint {
+    observed_at: DateTime<Utc>,
+    price: i64,
+    source: String,
+}
+
+/// Bounded on purpose. Without a default range and a row cap, one request for an
+/// old, frequently polled asset serialises hundreds of thousands of rows on the
+/// same host that runs ingestion.
+async fn asset_prices(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(range): Query<Range>,
+) -> Result<Json<Vec<PricePoint>>, ApiError> {
+    let to = range.to.unwrap_or_else(Utc::now);
+    let from = range.from.unwrap_or(to - chrono::Duration::days(30));
+
+    let rows = sqlx::query_as::<_, PricePoint>(
+        "SELECT observed_at, price, source
+           FROM market_observations
+          WHERE asset_id = $1 AND observed_at >= $2 AND observed_at <= $3
+          ORDER BY observed_at
+          LIMIT $4",
+    )
+    .bind(id)
+    .bind(from)
+    .bind(to)
+    .bind(s.config.api_row_cap)
+    .fetch_all(&s.pool)
+    .await?;
+    Ok(Json(rows))
+}
+
+async fn valuations(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<valuation::ClassValue>>, ApiError> {
+    let rows = valuation::class_median(&s.pool, MarketId(id), s.config.api_row_cap).await?;
+    Ok(Json(rows))
+}
+
+pub enum ApiError {
+    NotFound,
+    Internal(String),
+}
+
+impl From<sqlx::Error> for ApiError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Internal(e.to_string())
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e.to_string())
+    }
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (code, message) = match self {
+            Self::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            // The caller gets a readable sentence, the operator gets the detail.
+            Self::Internal(detail) => {
+                tracing::error!(%detail, "request failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "the server could not complete this request".to_string())
+            }
+        };
+        (code, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+/// Free bytes on the volume holding `path`, or None when the call fails.
+fn free_disk_bytes(path: &str) -> Option<u64> {
+    use std::ffi::CString;
+    let c = CString::new(path).ok()?;
+    // SAFETY: statvfs only reads through the pointer, and buf is initialised by
+    // the call before we read it.
+    unsafe {
+        let mut buf: libc_statvfs = std::mem::zeroed();
+        if statvfs(c.as_ptr(), &mut buf) != 0 {
+            return None;
+        }
+        Some(buf.f_bavail.saturating_mul(buf.f_frsize))
+    }
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+struct libc_statvfs {
+    f_bsize: u64,
+    f_frsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_favail: u64,
+    f_fsid: u64,
+    f_flag: u64,
+    f_namemax: u64,
+    f_spare: [u32; 6],
+}
+
+unsafe extern "C" {
+    #[link_name = "statvfs"]
+    fn statvfs(path: *const std::ffi::c_char, buf: *mut libc_statvfs) -> i32;
+}

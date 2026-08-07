@@ -1,0 +1,43 @@
+# Pinned on purpose. Section 4.2 depends on unique-constraint enforcement and
+# ON CONFLICT against compressed chunks, which needs TimescaleDB 2.11 or later.
+services:
+  db:
+    image: timescale/timescaledb:2.18.2-pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fcmarket
+      POSTGRES_PASSWORD: fcmarket
+      POSTGRES_DB: fcmarket
+    ports:
+      - "5434:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fcmarket -d fcmarket"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Stands in for production object storage. The server speaks the same S3 API to
+  # both, so there is one code path.
+  objectstore:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: fcmarket
+      MINIO_ROOT_PASSWORD: fcmarketsecret
+    ports:
+      - "9002:9000"
+      - "9003:9001"
+    volumes:
+      - objectstore-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  db-data:
+  objectstore-data:
