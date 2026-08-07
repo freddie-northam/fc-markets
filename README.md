@@ -47,10 +47,28 @@ automatically.
 
 ## Operating notes
 
-**`PG_DUMP_PATH` must match the server's major version.** The database image
-ships a matching `pg_dump`; a host binary often does not. A restore calls
-`timescaledb_pre_restore()` before the load and `timescaledb_post_restore()`
-after it.
+**`PG_DUMP_PATH` must be at least as new as the server.** The database image
+ships a matching `pg_dump`; a host binary is often a different version. Newer is
+fine, older is not.
+
+**Restoring is `scripts/restore.sh <dump-file> [target-database]`.** Do not do it
+by hand. `timescaledb_pre_restore()` must run before `pg_restore` and
+`timescaledb_post_restore()` after it, and skipping the first fails part way
+through with a misleading message:
+
+```
+ERROR: table "market_observations" is not a hypertable
+```
+
+by which point the database holds a partial restore.
+
+The restore path is verified, not assumed. A dump taken by the `backup` command
+and pulled back out of the bucket restores with identical row counts, keeps its
+hypertables, its compression settings, its already compressed chunks and its
+compression policies, and still rejects a duplicate while accepting a
+restatement. Pointing the server at the restored copy and running one ingest
+reports every known price as `unchanged`, which is what proves identity
+resolution and the idempotency index both survived.
 
 **Set the dead man's switch grace period above the largest poll interval**, which
 is four hours by default. A run that closes `degraded` or `failed` sends no
