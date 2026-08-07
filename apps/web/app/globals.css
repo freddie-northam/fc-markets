@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+/* A terminal reads better dark, and the operator watches it for long stretches. */
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-neutral-950 text-neutral-100 antialiased;
+}
