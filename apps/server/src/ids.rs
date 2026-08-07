@@ -49,7 +49,7 @@ typed_id!(RunId);
 
 /// The platform an asset trades on. A closed list, because free text lets a
 /// provider rename fork an asset's price history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
@@ -62,6 +62,17 @@ impl Platform {
         match self {
             Self::Playstation => "playstation",
             Self::Pc => "pc",
+        }
+    }
+
+    /// Returns None for anything outside the list. A platform we cannot name is
+    /// a platform we cannot key a market on, and guessing would fork a price
+    /// history under a second name.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "playstation" => Some(Self::Playstation),
+            "pc" => Some(Self::Pc),
+            _ => None,
         }
     }
 }

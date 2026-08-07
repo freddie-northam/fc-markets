@@ -1,6 +1,7 @@
-use crate::ids::{AssetId, MarketId, RunId};
+use crate::ids::{AssetId, MarketId, PollOutcome, RunId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 /// One canonical price observation. Every source converts into this shape, and
 /// nothing downstream can tell which provider supplied it.
@@ -17,6 +18,27 @@ pub struct Observation {
     pub max_price: Option<i64>,
     pub source_ref: Option<String>,
     pub ingest_run_id: RunId,
+}
+
+/// What one asked-about asset produced. The database decides `written` against
+/// `unchanged`, because only the idempotency index knows whether the price moved,
+/// so a passing record carries its observation rather than a verdict.
+#[derive(Debug, Clone)]
+pub enum PollResult {
+    Priced(Observation),
+    Failed(PollOutcome),
+}
+
+/// One asset we asked about, and what came back. Section 4.3: without this
+/// record the ledger cannot separate a stable price from an outage.
+#[derive(Debug, Clone)]
+pub struct Poll {
+    pub asset_id: AssetId,
+    pub market_id: MarketId,
+    /// Null exactly when the provider returned no timestamp, which is the case
+    /// that proves we looked and found nothing.
+    pub source_observed_at: Option<DateTime<Utc>>,
+    pub result: PollResult,
 }
 
 /// Card attributes. Every valuation input in the class median query reads these,
@@ -105,6 +127,39 @@ impl Rejection {
     }
 }
 
+/// Rule 1. Compares a payload name against the resolved asset.
+///
+/// This catches a provider that re-points an existing identifier at a different
+/// card, which would otherwise attach one card's prices to another card's history
+/// with nothing raising an error.
+///
+/// The comparison folds case, accents, punctuation and repeated spaces. A
+/// provider writing "Mbappe" where we hold "Mbappé" is the same footballer, and
+/// rejecting on that would reject every accented name on every poll.
+///
+/// We deliberately do NOT compare the rating. Ones to Watch, Path to Glory and
+/// Road to the Knockouts cards raise their rating in season by design, and EA
+/// also refreshes ratings mid season, so a rating check would reject exactly the
+/// high value cards until the metadata step caught up.
+pub fn names_match(payload: &str, resolved: &str) -> bool {
+    fold_name(payload) == fold_name(resolved)
+}
+
+fn fold_name(s: &str) -> String {
+    let flattened: String = s
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        // An apostrophe is elided rather than turned into a separator, because
+        // providers disagree on it within one word: "O'Neill" and "ONeill" are
+        // the same footballer. A hyphen or comma does separate, because
+        // "Jean-Pierre" and "Jean Pierre" are also the same footballer.
+        .filter(|c| !matches!(c, '\'' | '\u{2019}' | '\u{02BC}'))
+        .flat_map(char::to_lowercase)
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    flattened.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Rule 2. A single far future timestamp makes TimescaleDB create a chunk at
 /// that date, and that chunk then sits between us and every range query for the
 /// life of the database.
@@ -173,6 +228,23 @@ mod tests {
         let run = ts("2026-08-07T12:00:00Z");
         assert!(timestamp_in_range(ts("2026-08-07T12:03:00Z"), released, run));
         assert!(!timestamp_in_range(ts("2026-08-07T12:07:00Z"), released, run));
+    }
+
+    #[test]
+    fn a_name_that_differs_only_by_accent_or_case_still_matches() {
+        assert!(names_match("Kylian Mbappé", "Kylian Mbappe"));
+        assert!(names_match("kylian  mbappe", "Kylian Mbappe"));
+        assert!(names_match("O'Neill, Martin", "ONeill Martin"));
+        assert!(names_match("O\u{2019}Neill", "O'Neill"));
+        assert!(names_match("Jean-Pierre Papin", "Jean Pierre Papin"));
+    }
+
+    /// The check exists to catch a provider that re-points an identifier at a
+    /// different card, so a genuinely different footballer must fail it.
+    #[test]
+    fn a_different_footballer_fails_the_identity_check() {
+        assert!(!names_match("Kylian Mbappe", "Erling Haaland"));
+        assert!(!names_match("Lionel Messi", "Lionel Scaloni"));
     }
 
     /// The bound must follow the run, not the wall clock, or the same archive

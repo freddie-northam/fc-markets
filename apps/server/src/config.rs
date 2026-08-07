@@ -10,6 +10,10 @@ pub struct Config {
     pub object_store_bucket: String,
     pub object_store_access_key: String,
     pub object_store_secret_key: String,
+    /// Read by a provider module. No provider is available yet, so nothing
+    /// consumes these two today. They stay because section 4.5 requires the
+    /// source client to set an explicit request timeout, and a source added
+    /// without one would retry silently and spend the quota twice.
     pub source_api_key: Option<String>,
     pub daily_request_budget: u32,
     pub http_timeout: Duration,
@@ -18,6 +22,22 @@ pub struct Config {
     pub heartbeat_url: Option<String>,
     pub api_row_cap: i64,
     pub bind_address: String,
+    /// Which game the run works on. One row of `games`, resolved by code.
+    pub game_code: String,
+    /// How many assets the request budget can afford to follow. Section 4.7 sets
+    /// this from what the source allows, not from what the code can manage.
+    pub asset_coverage: i64,
+    pub discovery_cadence_seconds: i64,
+    pub metadata_cadence_seconds: i64,
+    /// Where the fixture source reads its payloads from. A real provider replaces
+    /// the source module and ignores this.
+    pub fixture_dir: String,
+    /// How often the `serve` interval task starts a run.
+    pub ingest_interval_seconds: u64,
+    /// `pg_dump` must match the server's major version. The container image ships
+    /// a matching one; a host binary often does not.
+    pub pg_dump_path: String,
+    pub backup_keep: usize,
 }
 
 impl Config {
@@ -37,7 +57,15 @@ impl Config {
             min_free_disk_bytes: num("MIN_FREE_DISK_BYTES", 5 * 1024 * 1024 * 1024)?,
             heartbeat_url: std::env::var("HEARTBEAT_URL").ok().filter(|s| !s.is_empty()),
             api_row_cap: num("API_ROW_CAP", 5_000)?,
-            bind_address: opt("BIND_ADDRESS", "0.0.0.0:8080"),
+            bind_address: opt("BIND_ADDRESS", "0.0.0.0:8090"),
+            game_code: opt("GAME_CODE", "FC26"),
+            asset_coverage: num("ASSET_COVERAGE", 600)?,
+            discovery_cadence_seconds: num("DISCOVERY_CADENCE_SECONDS", 86_400)?,
+            metadata_cadence_seconds: num("METADATA_CADENCE_SECONDS", 604_800)?,
+            fixture_dir: opt("FIXTURE_DIR", "fixtures/fixture"),
+            ingest_interval_seconds: num("INGEST_INTERVAL_SECONDS", 900)?,
+            pg_dump_path: opt("PG_DUMP_PATH", "pg_dump"),
+            backup_keep: num("BACKUP_KEEP", 30)?,
         })
     }
 }

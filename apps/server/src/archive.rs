@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,6 +28,7 @@ impl Envelope {
         body: serde_json::Value,
         fetched_at: DateTime<Utc>,
     ) -> Self {
+        // serde_json orders object keys, so one body always gives one digest.
         let digest = Sha256::digest(body.to_string().as_bytes());
         Self {
             fetched_at,
@@ -41,10 +43,17 @@ impl Envelope {
 
 /// Where an archived object lives. Date partitioned so a human can find the
 /// payload behind a given day without listing the whole bucket.
-pub fn object_key(source: &str, kind: Kind, run_id: &str, batch: usize, at: DateTime<Utc>) -> String {
+pub fn object_key(
+    source: &str,
+    kind: Kind,
+    run_id: &str,
+    batch: usize,
+    at: DateTime<Utc>,
+) -> String {
     let prefix = match kind {
         Kind::Prices => format!("raw/{source}"),
         Kind::Metadata => format!("raw/{source}/metadata"),
+        Kind::AssetList => format!("raw/{source}/assets"),
     };
     format!(
         "{prefix}/{:04}/{:02}/{:02}/{run_id}-{batch}.json.zst",
@@ -58,6 +67,7 @@ pub fn object_key(source: &str, kind: Kind, run_id: &str, batch: usize, at: Date
 pub enum Kind {
     Prices,
     Metadata,
+    AssetList,
 }
 
 /// Writes the archive before anything parses the payload, so an improved parser
@@ -65,13 +75,147 @@ pub enum Kind {
 ///
 /// A failed write is fatal to the batch. The alternative would be observations
 /// whose stated source of truth does not exist, which quietly voids replay.
-pub trait Archive {
-    fn put(&self, key: &str, envelope: &Envelope) -> Result<()>;
-    fn get(&self, key: &str) -> Result<Envelope>;
+#[async_trait]
+pub trait Archive: Send + Sync {
+    async fn put(&self, key: &str, envelope: &Envelope) -> Result<()>;
+    async fn get(&self, key: &str) -> Result<Envelope>;
 }
 
-/// Filesystem backed archive. The S3 client speaks the same two operations, so
-/// swapping it in adds a struct and changes no caller.
+fn encode(envelope: &Envelope) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(envelope)?;
+    Ok(zstd::encode_all(&json[..], 3)?)
+}
+
+fn decode(bytes: &[u8]) -> Result<Envelope> {
+    let json = zstd::decode_all(bytes)?;
+    Ok(serde_json::from_slice(&json)?)
+}
+
+/// S3 compatible object storage. MinIO in development and the same code path in
+/// production, which is why there is no storage abstraction beyond this.
+pub struct S3Archive {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+}
+
+impl S3Archive {
+    pub async fn connect(
+        endpoint: &str,
+        bucket: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<Self> {
+        let credentials = aws_sdk_s3::config::Credentials::new(
+            access_key,
+            secret_key,
+            None,
+            None,
+            "fc-market-config",
+        );
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .credentials_provider(credentials)
+            // MinIO serves paths, not virtual hosted buckets.
+            .force_path_style(true)
+            .build();
+
+        let archive = Self {
+            client: aws_sdk_s3::Client::from_conf(config),
+            bucket: bucket.to_string(),
+        };
+        archive.ensure_bucket().await?;
+        Ok(archive)
+    }
+
+    /// The archive is a precondition for ingestion, so a missing bucket must fail
+    /// at start rather than at the first batch write.
+    async fn ensure_bucket(&self) -> Result<()> {
+        if self
+            .client
+            .head_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.client
+            .create_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .with_context(|| format!("cannot create bucket {}", self.bucket))?;
+        Ok(())
+    }
+
+    /// Used by the nightly dump, which stores a binary file rather than an
+    /// envelope.
+    pub async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(bytes.into())
+            .send()
+            .await
+            .with_context(|| format!("cannot write {key}"))?;
+        Ok(())
+    }
+
+    pub async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
+        let mut pages = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .into_paginator()
+            .send();
+
+        while let Some(page) = pages.next().await {
+            let page = page.with_context(|| format!("cannot list {prefix}"))?;
+            keys.extend(page.contents().iter().filter_map(|o| o.key().map(String::from)));
+        }
+        Ok(keys)
+    }
+
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("cannot delete {key}"))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Archive for S3Archive {
+    async fn put(&self, key: &str, envelope: &Envelope) -> Result<()> {
+        self.put_bytes(key, encode(envelope)?).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Envelope> {
+        let object = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("cannot read {key}"))?;
+        let bytes = object.body.collect().await?.into_bytes();
+        decode(&bytes)
+    }
+}
+
+/// Filesystem backed archive. Tests and offline replay use it. It writes the
+/// same bytes under the same keys as `S3Archive`.
 pub struct FileArchive {
     root: std::path::PathBuf,
 }
@@ -82,26 +226,27 @@ impl FileArchive {
     }
 }
 
+#[async_trait]
 impl Archive for FileArchive {
-    fn put(&self, key: &str, envelope: &Envelope) -> Result<()> {
+    async fn put(&self, key: &str, envelope: &Envelope) -> Result<()> {
         let path = self.root.join(key);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            tokio::fs::create_dir_all(parent)
+                .await
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
-        let json = serde_json::to_vec(envelope)?;
-        let compressed = zstd::encode_all(&json[..], 3)?;
-        std::fs::write(&path, compressed)
+        tokio::fs::write(&path, encode(envelope)?)
+            .await
             .with_context(|| format!("cannot write {}", path.display()))?;
         Ok(())
     }
 
-    fn get(&self, key: &str) -> Result<Envelope> {
+    async fn get(&self, key: &str) -> Result<Envelope> {
         let path = self.root.join(key);
-        let compressed = std::fs::read(&path)
+        let bytes = tokio::fs::read(&path)
+            .await
             .with_context(|| format!("cannot read {}", path.display()))?;
-        let json = zstd::decode_all(&compressed[..])?;
-        Ok(serde_json::from_slice(&json)?)
+        decode(&bytes)
     }
 }
 
@@ -115,8 +260,8 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    #[test]
-    fn a_written_envelope_reads_back_identically() {
+    #[tokio::test]
+    async fn a_written_envelope_reads_back_identically() {
         let dir = std::env::temp_dir().join(format!("fcm-archive-{}", uuid::Uuid::now_v7()));
         let archive = FileArchive::new(&dir);
         let env = Envelope::new(
@@ -128,8 +273,8 @@ mod tests {
         );
 
         let key = object_key("fixture", Kind::Prices, "run-1", 0, at());
-        archive.put(&key, &env).unwrap();
-        let back = archive.get(&key).unwrap();
+        archive.put(&key, &env).await.unwrap();
+        let back = archive.get(&key).await.unwrap();
 
         assert_eq!(back.body, env.body);
         assert_eq!(back.requested_ids, vec!["101", "102"]);
@@ -138,11 +283,13 @@ mod tests {
     }
 
     #[test]
-    fn prices_and_metadata_do_not_share_a_prefix() {
+    fn each_kind_of_payload_gets_its_own_prefix() {
         let p = object_key("fixture", Kind::Prices, "r", 0, at());
         let m = object_key("fixture", Kind::Metadata, "r", 0, at());
+        let a = object_key("fixture", Kind::AssetList, "r", 0, at());
         assert_eq!(p, "raw/fixture/2026/08/07/r-0.json.zst");
         assert_eq!(m, "raw/fixture/metadata/2026/08/07/r-0.json.zst");
+        assert_eq!(a, "raw/fixture/assets/2026/08/07/r-0.json.zst");
     }
 
     #[test]

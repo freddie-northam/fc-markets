@@ -1,0 +1,23 @@
+[
+  { "id": "505120", "name": "Zinedine Zidane" },
+  { "id": "231747", "name": "Kylian Mbappe" },
+  { "id": "239085", "name": "Erling Haaland" },
+  { "id": "192985", "name": "Kevin De Bruyne" },
+  { "id": "202126", "name": "Harry Kane" },
+  { "id": "20801", "name": "Cristiano Ronaldo" },
+  { "id": "158023", "name": "Lionel Messi" },
+  { "id": "212198", "name": "Bruno Fernandes" },
+  { "id": "209331", "name": "Mohamed Salah" },
+  { "id": "190871", "name": "Neymar Jr" },
+  { "id": "167495", "name": "Manuel Neuer" },
+  { "id": "200389", "name": "Jan Oblak" },
+  { "id": "201535", "name": "Marco Verratti" },
+  { "id": "100001", "name": "Diego Rossi" },
+  { "id": "100002", "name": "Tomas Holub" },
+  { "id": "100003", "name": "Andre Silva" },
+  { "id": "100004", "name": "Kwame Mensah" },
+  { "id": "100005", "name": "Luca Bianchi" },
+  { "id": "900001", "name": "Unpriced Reserve" },
+  { "id": "900002", "name": "Undated Reserve" },
+  { "id": "900003", "name": "Floored Reserve" }
+]
