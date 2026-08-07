@@ -239,6 +239,15 @@ async fn ingest_prices(
     budget: &mut Budget,
     tally: &mut Tally,
 ) -> Result<()> {
+    // Checked before the query, not after it. With nothing left to spend the
+    // query returns no rows, which is indistinguishable from nothing being due,
+    // and the run would close ok and send a heartbeat while the ledger had
+    // stopped. Silence is the alarm, so the run must not look healthy here.
+    if budget.remaining == 0 {
+        tally.degrade("the daily request budget was already spent, so no price was read");
+        return Ok(());
+    }
+
     let batch_size = runner.source.price_batch_size().max(1);
     // Ask for no more identifiers than the day can still pay for.
     let affordable = (budget.remaining as i64).saturating_mul(batch_size as i64);
@@ -444,11 +453,9 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
     let (replacement, _) =
         db::open_run(runner.pool, runner.source.name(), runner.source.parser_version()).await?;
 
-    let mut report = ReplayReport {
-        deleted: db::delete_run_observations(runner.pool, original).await?,
-        rewritten: 0,
-    };
-
+    // Everything is read and parsed BEFORE anything is deleted. A failed archive
+    // read must leave the ledger exactly as it was.
+    let mut replacements = Vec::new();
     let mut tally = Tally::default();
     for key in &keys {
         let envelope = runner.archive.get(key).await?;
@@ -495,8 +502,12 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
                 }),
             }
         }
-        report.rewritten += db::insert_observations(runner.pool, &observations, replacement).await?;
+        replacements.extend(observations);
     }
+
+    let (deleted, rewritten) =
+        db::replace_run_observations(runner.pool, original, replacement, &replacements).await?;
+    let report = ReplayReport { deleted, rewritten };
 
     tally.written = report.rewritten as i32;
     db::close_run(

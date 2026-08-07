@@ -221,38 +221,46 @@ impl axum::response::IntoResponse for ApiError {
 }
 
 /// Free bytes on the volume holding `path`, or None when the call fails.
+///
+/// The layout comes from `libc`, never from a struct declared here. `fsblkcnt_t`
+/// is 32 bits on macOS and 64 on Linux, so a hand written binding that assumes
+/// one width reads the wrong fields on the other platform and returns nonsense.
+/// It would do so silently, and this is the check that keeps compression from
+/// filling the volume and stopping PostgreSQL.
 fn free_disk_bytes(path: &str) -> Option<u64> {
     use std::ffi::CString;
+
     let c = CString::new(path).ok()?;
-    // SAFETY: statvfs only reads through the pointer, and buf is initialised by
-    // the call before we read it.
-    unsafe {
-        let mut buf: libc_statvfs = std::mem::zeroed();
-        if statvfs(c.as_ptr(), &mut buf) != 0 {
-            return None;
-        }
-        Some(buf.f_bavail.saturating_mul(buf.f_frsize))
+    let mut buf = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+
+    // SAFETY: `c` is a valid nul terminated path, and statvfs either fills `buf`
+    // completely or returns non-zero, which is the only case we read it in.
+    let failed = unsafe { libc::statvfs(c.as_ptr(), buf.as_mut_ptr()) } != 0;
+    if failed {
+        return None;
     }
+    let buf = unsafe { buf.assume_init() };
+    Some(u64::from(buf.f_bavail).saturating_mul(u64::from(buf.f_frsize)))
 }
 
-#[repr(C)]
-#[allow(non_camel_case_types)]
-struct libc_statvfs {
-    f_bsize: u64,
-    f_frsize: u64,
-    f_blocks: u64,
-    f_bfree: u64,
-    f_bavail: u64,
-    f_files: u64,
-    f_ffree: u64,
-    f_favail: u64,
-    f_fsid: u64,
-    f_flag: u64,
-    f_namemax: u64,
-    f_spare: [u32; 6],
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-unsafe extern "C" {
-    #[link_name = "statvfs"]
-    fn statvfs(path: *const std::ffi::c_char, buf: *mut libc_statvfs) -> i32;
+    /// A plausibility check rather than an exact one: the number must be a real
+    /// figure for the volume, not the garbage a mismatched struct layout gives.
+    #[test]
+    fn free_disk_space_is_a_believable_figure() {
+        let free = free_disk_bytes(".").expect("statvfs must answer for the working directory");
+        assert!(free > 1024 * 1024, "an implausibly small figure: {free}");
+        assert!(
+            free < 1 << 50,
+            "an implausibly large figure, which is what a wrong layout gives: {free}"
+        );
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_returns_none() {
+        assert_eq!(free_disk_bytes("/no/such/path/here"), None);
+    }
 }

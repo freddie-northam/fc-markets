@@ -743,15 +743,39 @@ pub async fn largest_poll_interval_seconds(pool: &PgPool) -> Result<i32> {
 // Replay
 // ---------------------------------------------------------------------------
 
+/// Swaps one run's observations for a freshly parsed set, in one transaction.
+///
 /// Replay is the one deliberate exception to the append-only rule. Without it a
 /// parser bug would be permanent, because ON CONFLICT DO NOTHING keeps whatever
 /// was written first.
-pub async fn delete_run_observations(pool: &PgPool, run_id: RunId) -> Result<u64> {
-    let r = sqlx::query("DELETE FROM market_observations WHERE ingest_run_id = $1")
-        .bind(run_id.0)
-        .execute(pool)
-        .await?;
-    Ok(r.rows_affected())
+///
+/// The delete and the rewrite are one unit on purpose. A delete that committed
+/// before a failed rewrite would destroy exactly the rows the replay set out to
+/// correct, and the caller would be left with a gap it could only fill by
+/// getting the archive read to work.
+pub async fn replace_run_observations(
+    pool: &PgPool,
+    original: RunId,
+    replacement: RunId,
+    observations: &[Observation],
+) -> Result<(u64, u64)> {
+    let mut tx = pool.begin().await?;
+
+    let deleted = sqlx::query("DELETE FROM market_observations WHERE ingest_run_id = $1")
+        .bind(original.0)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+    let mut written = 0;
+    for o in observations {
+        if insert_observation(&mut tx, o, replacement).await? {
+            written += 1;
+        }
+    }
+
+    tx.commit().await?;
+    Ok((deleted, written))
 }
 
 /// Identity resolution on its own, with no reference to the schedule.
@@ -790,25 +814,6 @@ pub async fn resolve_targets(
             })
         })
         .collect()
-}
-
-/// Observations without poll rows. Replay uses this: a replay re-reads an
-/// archive, it is not evidence that we looked at the market, so it must not
-/// manufacture coverage.
-pub async fn insert_observations(
-    pool: &PgPool,
-    observations: &[Observation],
-    run_id: RunId,
-) -> Result<u64> {
-    let mut tx = pool.begin().await?;
-    let mut written = 0;
-    for o in observations {
-        if insert_observation(&mut tx, o, run_id).await? {
-            written += 1;
-        }
-    }
-    tx.commit().await?;
-    Ok(written)
 }
 
 /// The archive keys one run wrote, in the order it wrote them. Replay re-reads

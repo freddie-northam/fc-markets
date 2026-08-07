@@ -837,3 +837,71 @@ async fn replay_keeps_the_original_runs_verdict_on_a_timestamp() {
     );
     db.cleanup().await;
 }
+
+/// A spent budget must not look like a healthy, quiet run.
+///
+/// With nothing left to spend the due query returns no rows, which reads exactly
+/// like nothing being due. If the run closed `ok` it would send a heartbeat, and
+/// the dead man's switch would stay green while the ledger had stopped.
+#[tokio::test]
+async fn a_run_that_cannot_afford_a_single_request_does_not_close_ok() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 4)]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let mut config = db.config();
+    config.daily_request_budget = 0;
+    // The slow steps are not due, so only the price path is left to notice.
+    config.discovery_cadence_seconds = 86_400;
+    config.metadata_cadence_seconds = 604_800;
+    make_everything_due(&db.pool).await.unwrap();
+
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &archive,
+        source: &source,
+        config: &config,
+    };
+    let outcome = ingest::run(&runner).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    db.cleanup().await;
+}
+
+/// The delete and the rewrite are one transaction. A delete that committed
+/// before a failed rewrite would destroy exactly the rows the replay set out to
+/// correct.
+#[tokio::test]
+async fn a_replay_that_cannot_read_its_archive_leaves_the_ledger_untouched() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![
+        Card::new("101", "Marco Verratti").recent(9_000, 4),
+        Card::new("102", "Bruno Fernandes").recent(15_000, 4),
+    ]);
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+    let RunOutcome::Completed { run_id, .. } = outcome else {
+        panic!("the run must complete")
+    };
+
+    let before = db.count("SELECT count(*) FROM market_observations").await;
+    assert_eq!(before, 4);
+
+    // The object store has gone away between the run and the replay.
+    let config = db.config();
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &RefusingArchive,
+        source: &source,
+        config: &config,
+    };
+    assert!(ingest::replay(&runner, run_id).await.is_err());
+
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        before,
+        "a failed replay must not leave a hole where the history was"
+    );
+    db.cleanup().await;
+}

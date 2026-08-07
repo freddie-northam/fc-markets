@@ -66,7 +66,16 @@ pub(crate) async fn maybe_discover(
         return Ok(());
     }
 
-    let listings = runner.source.parse_asset_list(&envelope)?;
+    // A parse failure here degrades the run rather than ending it. The asset
+    // list changing shape must not also stop us reading prices for the assets we
+    // already know: that would turn a discovery problem into a gap in the ledger.
+    let listings = match runner.source.parse_asset_list(&envelope) {
+        Ok(listings) => listings,
+        Err(e) => {
+            tally.degrade(format!("the asset list could not be parsed: {e}"));
+            return Ok(());
+        }
+    };
     let known = db::known_external_ids(runner.pool, source, game.id).await?;
 
     let mut added = 0;
@@ -160,7 +169,17 @@ pub(crate) async fn maybe_refresh_metadata(
             continue;
         }
 
-        for attrs in runner.source.parse_metadata(&envelope)? {
+        // Same reasoning as the asset list: a metadata schema change must not
+        // stop the price path, which is the part that cannot be caught up later.
+        let parsed = match runner.source.parse_metadata(&envelope) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tally.degrade(format!("metadata batch {batch} could not be parsed: {e}"));
+                continue;
+            }
+        };
+
+        for attrs in parsed {
             let Some(asset) =
                 db::asset_by_external_id(runner.pool, source, game.id, &attrs.external_id).await?
             else {
