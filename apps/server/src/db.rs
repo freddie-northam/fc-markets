@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// One lock identifier for the whole ingest path. The serve loop and the CLI
 /// share one entry point, so without this a slow run and a manual run spend the
 /// request budget twice and race on poll state.
-const INGEST_LOCK: i64 = 0x0FC_1_A5_5E7;
+const INGEST_LOCK: i64 = 0x0000_FC1A_55E7;
 
 /// How long a run may go without a heartbeat before the next start declares it
 /// dead. A run that dies leaves its status at `running` for ever, which makes the
@@ -117,7 +117,11 @@ fn platform(raw: &str) -> Result<Platform> {
 /// Returns the run's own start alongside its identifier. Rule 2 bounds
 /// timestamps against this value rather than the wall clock, so replaying one
 /// archive twice gives the same table.
-pub async fn open_run(pool: &PgPool, source: &str, parser_version: &str) -> Result<(RunId, DateTime<Utc>)> {
+pub async fn open_run(
+    pool: &PgPool,
+    source: &str,
+    parser_version: &str,
+) -> Result<(RunId, DateTime<Utc>)> {
     let id = RunId::new();
     let started_at: DateTime<Utc> = sqlx::query_scalar(
         "INSERT INTO ingest_runs (id, source, parser_version, heartbeat_at)
@@ -208,6 +212,23 @@ pub async fn requests_spent_today(pool: &PgPool, source: &str) -> Result<i64> {
 // Scheduling
 // ---------------------------------------------------------------------------
 
+/// The row shape both target queries select, before it becomes a `PollTarget`.
+type TargetRow = (Uuid, Uuid, String, String, String);
+
+fn to_targets(rows: Vec<TargetRow>) -> Result<Vec<PollTarget>> {
+    rows.into_iter()
+        .map(|(asset_id, market_id, external_id, raw, name)| {
+            Ok(PollTarget {
+                asset_id: AssetId(asset_id),
+                market_id: MarketId(market_id),
+                external_id,
+                platform: platform(&raw)?,
+                name,
+            })
+        })
+        .collect()
+}
+
 /// One asset, one market, and the identifier the source knows it by.
 pub struct PollTarget {
     pub asset_id: AssetId,
@@ -257,7 +278,7 @@ pub async fn poll_targets_for(
     game: GameId,
     external_ids: &[String],
 ) -> Result<Vec<PollTarget>> {
-    let rows: Vec<(Uuid, Uuid, String, String, String)> = sqlx::query_as(
+    let rows: Vec<TargetRow> = sqlx::query_as(
         "SELECT s.asset_id, s.market_id, si.external_id, m.platform, a.name
            FROM asset_poll_state s
            JOIN assets  a ON a.id = s.asset_id
@@ -272,17 +293,7 @@ pub async fn poll_targets_for(
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
-        .map(|(asset_id, market_id, external_id, raw, name)| {
-            Ok(PollTarget {
-                asset_id: AssetId(asset_id),
-                market_id: MarketId(market_id),
-                external_id,
-                platform: platform(&raw)?,
-                name,
-            })
-        })
-        .collect()
+    to_targets(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -521,11 +532,7 @@ pub async fn most_valuable_assets(
 ///
 /// Only the schedule goes. The observations and the coverage record stay, because
 /// the ledger is the asset, and the quota frees immediately.
-pub async fn drop_poll_state_outside(
-    pool: &PgPool,
-    game: GameId,
-    covered: &[Uuid],
-) -> Result<u64> {
+pub async fn drop_poll_state_outside(pool: &PgPool, game: GameId, covered: &[Uuid]) -> Result<u64> {
     let r = sqlx::query(
         "DELETE FROM asset_poll_state s
           USING assets a
@@ -652,13 +659,11 @@ pub async fn update_asset_attributes(
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(
-        "UPDATE asset_poll_state SET poll_interval_seconds = $2 WHERE asset_id = $1",
-    )
-    .bind(asset.0)
-    .bind(interval_seconds)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("UPDATE asset_poll_state SET poll_interval_seconds = $2 WHERE asset_id = $1")
+        .bind(asset.0)
+        .bind(interval_seconds)
+        .execute(&mut *tx)
+        .await?;
 
     if let Some(ea_base_id) = attrs.ea_base_id {
         link_player(&mut tx, asset, &attrs.name, ea_base_id).await?;
@@ -724,11 +729,11 @@ async fn link_player(
 /// table records changes only, so a quiet market writes nothing and would look
 /// exactly like an outage.
 pub async fn newest_poll_age_seconds(pool: &PgPool) -> Result<Option<f64>> {
-    Ok(
-        sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM (now() - max(polled_at)))::float8 FROM ingest_polls")
-            .fetch_one(pool)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM (now() - max(polled_at)))::float8 FROM ingest_polls",
     )
+    .fetch_one(pool)
+    .await?)
 }
 
 pub async fn largest_poll_interval_seconds(pool: &PgPool) -> Result<i32> {
@@ -790,7 +795,7 @@ pub async fn resolve_targets(
     game: GameId,
     external_ids: &[String],
 ) -> Result<Vec<PollTarget>> {
-    let rows: Vec<(Uuid, Uuid, String, String, String)> = sqlx::query_as(
+    let rows: Vec<TargetRow> = sqlx::query_as(
         "SELECT si.asset_id, m.id, si.external_id, m.platform, a.name
            FROM asset_source_ids si
            JOIN assets  a ON a.id = si.asset_id
@@ -803,17 +808,7 @@ pub async fn resolve_targets(
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
-        .map(|(asset_id, market_id, external_id, raw, name)| {
-            Ok(PollTarget {
-                asset_id: AssetId(asset_id),
-                market_id: MarketId(market_id),
-                external_id,
-                platform: platform(&raw)?,
-                name,
-            })
-        })
-        .collect()
+    to_targets(rows)
 }
 
 /// The archive keys one run wrote, in the order it wrote them. Replay re-reads

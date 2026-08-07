@@ -87,7 +87,10 @@ async fn the_asset_list_and_the_card_attributes_parse_from_disk() {
     assert_eq!(attributes.len(), 21);
 
     // The canonical domains we own, mapped at the edge.
-    let zidane = attributes.iter().find(|a| a.external_id == "505120").unwrap();
+    let zidane = attributes
+        .iter()
+        .find(|a| a.external_id == "505120")
+        .unwrap();
     assert_eq!(zidane.version, "icon");
     assert_eq!(zidane.rating, Some(95));
     assert_eq!(zidane.playstyle_count, Some(4));
@@ -106,8 +109,12 @@ async fn the_later_fixture_holds_the_same_cards_at_moved_prices() {
     let later = FixtureSource::new(fixture_dir("fixture-later"));
     let wanted = vec!["201535".to_string()];
 
-    let before = first.parse_prices(&first.fetch_prices(&wanted).await.unwrap()).unwrap();
-    let after = later.parse_prices(&later.fetch_prices(&wanted).await.unwrap()).unwrap();
+    let before = first
+        .parse_prices(&first.fetch_prices(&wanted).await.unwrap())
+        .unwrap();
+    let after = later
+        .parse_prices(&later.fetch_prices(&wanted).await.unwrap())
+        .unwrap();
 
     assert_eq!(before.len(), after.len());
     assert_ne!(before[0].price, after[0].price, "the price must have moved");

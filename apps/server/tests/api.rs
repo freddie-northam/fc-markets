@@ -149,7 +149,10 @@ async fn an_unknown_asset_is_a_404_and_a_known_one_is_a_200() {
         .unwrap();
     let server = Server::start(&db, db.config()).await;
 
-    assert_eq!(server.get(&format!("/assets/{}", asset.0)).await.status(), 200);
+    assert_eq!(
+        server.get(&format!("/assets/{}", asset.0)).await.status(),
+        200
+    );
     assert_eq!(
         server
             .get("/assets/00000000-0000-4000-8000-000000000000")

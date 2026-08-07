@@ -22,8 +22,8 @@ const PC_: Platform = Platform::Pc;
 use fc_market::source::{FetchError, FetchResult, Listing, ParsedQuote, Source};
 use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 /// The game seeded by migration 0002.
@@ -222,6 +222,31 @@ impl Archive for RefusingArchive {
 // Source double
 // ---------------------------------------------------------------------------
 
+/// One platform's quote for a card, as the provider would state it.
+#[derive(Clone)]
+pub struct TestQuote {
+    pub platform: Platform,
+    pub price: Option<i64>,
+    pub min_price: Option<i64>,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+impl TestQuote {
+    fn new(
+        platform: Platform,
+        price: Option<i64>,
+        min_price: i64,
+        observed_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            platform,
+            price,
+            min_price: Some(min_price),
+            observed_at,
+        }
+    }
+}
+
 /// One card the test source will serve.
 #[derive(Clone)]
 pub struct Card {
@@ -231,8 +256,7 @@ pub struct Card {
     pub version: String,
     pub rarity: Rarity,
     pub ea_base_id: Option<i64>,
-    /// Per platform: price, min price, source timestamp.
-    pub quotes: Vec<(Platform, Option<i64>, Option<i64>, Option<DateTime<Utc>>)>,
+    pub quotes: Vec<TestQuote>,
     /// The name the PRICE payload carries, when it differs from `name`. Rule 1
     /// compares this against the resolved asset.
     pub payload_name: Option<String>,
@@ -273,7 +297,8 @@ impl Card {
     }
 
     pub fn quote(mut self, platform: Platform, price: i64, at: &str) -> Self {
-        self.quotes.push((platform, Some(price), Some(200), Some(ts(at))));
+        self.quotes
+            .push(TestQuote::new(platform, Some(price), 200, Some(ts(at))));
         self
     }
 
@@ -284,32 +309,43 @@ impl Card {
     /// makes a count assertion read as though something failed.
     pub fn recent(mut self, price: i64, hours: i64) -> Self {
         let at = hours_ago(hours);
-        self.quotes.push((PS_, Some(price), Some(200), Some(at)));
-        self.quotes.push((PC_, Some(price * 97 / 100), Some(200), Some(at)));
+        self.quotes
+            .push(TestQuote::new(PS_, Some(price), 200, Some(at)));
+        self.quotes
+            .push(TestQuote::new(PC_, Some(price * 97 / 100), 200, Some(at)));
         self
     }
 
-    pub fn quote_with_floor(mut self, platform: Platform, price: i64, floor: i64, at: &str) -> Self {
+    pub fn quote_with_floor(
+        mut self,
+        platform: Platform,
+        price: i64,
+        floor: i64,
+        at: &str,
+    ) -> Self {
         self.quotes
-            .push((platform, Some(price), Some(floor), Some(ts(at))));
+            .push(TestQuote::new(platform, Some(price), floor, Some(ts(at))));
         self
     }
 
     /// A quote the provider returned with no price at all.
     pub fn no_price(mut self, platform: Platform, at: &str) -> Self {
-        self.quotes.push((platform, None, Some(200), Some(ts(at))));
+        self.quotes
+            .push(TestQuote::new(platform, None, 200, Some(ts(at))));
         self
     }
 
     /// A quote with a price but no usable timestamp. Rule 3 rejects it.
     pub fn undated(mut self, platform: Platform, price: i64) -> Self {
-        self.quotes.push((platform, Some(price), Some(200), None));
+        self.quotes
+            .push(TestQuote::new(platform, Some(price), 200, None));
         self
     }
 
     /// A quote whose timestamp sits outside the game's lifetime. Rule 2 rejects it.
     pub fn at_raw(mut self, platform: Platform, price: i64, at: DateTime<Utc>) -> Self {
-        self.quotes.push((platform, Some(price), Some(200), Some(at)));
+        self.quotes
+            .push(TestQuote::new(platform, Some(price), 200, Some(at)));
         self
     }
 }
@@ -368,7 +404,7 @@ impl TestSource {
             .lock()
             .unwrap()
             .iter()
-            .filter(|c| wanted.iter().any(|w| *w == c.external_id))
+            .filter(|c| wanted.contains(&c.external_id))
             .cloned()
             .collect()
     }
@@ -421,15 +457,18 @@ impl Source for TestSource {
         let cards = self.selected(&ids);
         let mut out = Vec::new();
         for card in cards {
-            for (platform, price, min_price, observed_at) in &card.quotes {
+            for quote in &card.quotes {
                 out.push(ParsedQuote {
                     external_id: card.external_id.clone(),
-                    platform: *platform,
-                    price: *price,
-                    min_price: *min_price,
+                    platform: quote.platform,
+                    price: quote.price,
+                    min_price: quote.min_price,
                     max_price: None,
-                    observed_at: *observed_at,
-                    name: card.payload_name.clone().or_else(|| Some(card.name.clone())),
+                    observed_at: quote.observed_at,
+                    name: card
+                        .payload_name
+                        .clone()
+                        .or_else(|| Some(card.name.clone())),
                 });
             }
         }
@@ -501,11 +540,13 @@ impl Source for TestSource {
 pub async fn seed_second_game(pool: &PgPool) -> Result<(GameId, MarketId)> {
     let game = GameId::new();
     let market = MarketId::new();
-    sqlx::query("INSERT INTO games (id, code, name, released_at) VALUES ($1,'FC27','EA SPORTS FC 27',$2)")
-        .bind(game.0)
-        .bind(ts("2026-09-25T00:00:00Z"))
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO games (id, code, name, released_at) VALUES ($1,'FC27','EA SPORTS FC 27',$2)",
+    )
+    .bind(game.0)
+    .bind(ts("2026-09-25T00:00:00Z"))
+    .execute(pool)
+    .await?;
     sqlx::query("INSERT INTO markets (id, game_id, platform) VALUES ($1,$2,'playstation')")
         .bind(market.0)
         .bind(game.0)

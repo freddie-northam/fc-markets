@@ -43,9 +43,11 @@ fn status(outcome: &RunOutcome) -> RunStatus {
 #[tokio::test]
 async fn one_external_identifier_always_maps_to_one_internal_asset() {
     let db = TestDb::new().await.unwrap();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     let archive = MemoryArchive::default();
 
     run_once(&db, &source, &archive).await.unwrap();
@@ -69,15 +71,11 @@ async fn two_sources_map_to_one_internal_asset() {
     );
     run_once(&db, &first, &archive).await.unwrap();
 
-    let asset: AssetId = db::asset_by_external_id(
-        &db.pool,
-        "alpha",
-        db.game().await.unwrap().id,
-        "101",
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let asset: AssetId =
+        db::asset_by_external_id(&db.pool, "alpha", db.game().await.unwrap().id, "101")
+            .await
+            .unwrap()
+            .unwrap();
 
     // The second provider knows the same card by a different identifier. Mapping
     // it onto the existing asset is what keeps one price history per card.
@@ -112,9 +110,11 @@ async fn two_sources_map_to_one_internal_asset() {
 async fn the_same_external_identifier_in_two_games_maps_to_two_assets() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     // The next title reuses identifier 101 for a different card. Without game_id
@@ -147,9 +147,11 @@ async fn the_same_external_identifier_in_two_games_maps_to_two_assets() {
 async fn a_payload_whose_name_disagrees_with_the_resolved_asset_is_rejected() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     // The provider re-points identifier 101 at a different footballer. Rule 1
@@ -184,12 +186,16 @@ async fn a_payload_whose_rating_disagrees_is_accepted() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").rating(84).recent(9_000, 6),
+        Card::new("101", "Marco Verratti")
+            .rating(84)
+            .recent(9_000, 6),
     ]);
     run_once(&db, &source, &archive).await.unwrap();
 
     source.set_cards(vec![
-        Card::new("101", "Marco Verratti").rating(88).recent(40_000, 3),
+        Card::new("101", "Marco Verratti")
+            .rating(88)
+            .recent(40_000, 3),
     ]);
     make_everything_due(&db.pool).await.unwrap();
     let outcome = run_once(&db, &source, &archive).await.unwrap();
@@ -326,9 +332,11 @@ async fn one_payload_ingested_twice_does_not_double_the_observation_count() {
 async fn the_unique_constraint_still_rejects_a_duplicate_after_chunk_compression() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     let compressed: i64 = sqlx::query_scalar(
@@ -363,14 +371,18 @@ async fn the_unique_constraint_still_rejects_a_duplicate_after_chunk_compression
 async fn a_different_price_at_the_same_timestamp_lands_as_a_second_row() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
-    source.set_cards(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_400, "2026-01-05T09:00:00Z"),
-    ]);
+    source.set_cards(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_400,
+        "2026-01-05T09:00:00Z",
+    )]);
     make_everything_due(&db.pool).await.unwrap();
     run_once(&db, &source, &archive).await.unwrap();
 
@@ -386,9 +398,11 @@ async fn a_different_price_at_the_same_timestamp_lands_as_a_second_row() {
 async fn an_old_observed_at_and_a_current_ingested_at_stay_separate() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2025-10-01T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2025-10-01T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     let (observed, ingested): (chrono::DateTime<Utc>, chrono::DateTime<Utc>) =
@@ -467,7 +481,9 @@ async fn a_missing_source_timestamp_is_rejected_and_counted() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "Undated").undated(PS, 9_000).undated(PC, 9_000),
+        Card::new("101", "Undated")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
     ]);
     run_once(&db, &source, &archive).await.unwrap();
 
@@ -477,8 +493,10 @@ async fn a_missing_source_timestamp_is_rejected_and_counted() {
         "we never substitute our own clock for a missing source timestamp"
     );
     assert_eq!(
-        db.count("SELECT records_rejected::bigint FROM ingest_runs ORDER BY started_at DESC LIMIT 1")
-            .await,
+        db.count(
+            "SELECT records_rejected::bigint FROM ingest_runs ORDER BY started_at DESC LIMIT 1"
+        )
+        .await,
         2
     );
     assert_eq!(
@@ -497,9 +515,11 @@ async fn a_missing_source_timestamp_is_rejected_and_counted() {
 async fn an_unchanged_price_writes_a_poll_row_with_outcome_unchanged() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
     make_everything_due(&db.pool).await.unwrap();
     run_once(&db, &source, &archive).await.unwrap();
@@ -523,7 +543,9 @@ async fn a_rejected_record_writes_a_poll_row_with_its_own_outcome() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "Undated").undated(PS, 9_000).undated(PC, 9_000),
+        Card::new("101", "Undated")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
         Card::new("102", "Priceless")
             .no_price(PS, "2026-01-05T09:00:00Z")
             .no_price(PC, "2026-01-05T09:00:00Z"),
@@ -555,7 +577,9 @@ async fn one_bad_record_does_not_fail_the_run() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "Undated").undated(PS, 9_000).undated(PC, 9_000),
+        Card::new("101", "Undated")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
         Card::new("102", "Sound").recent(12_000, 4),
         Card::new("103", "Also sound").recent(13_000, 4),
     ]);
@@ -581,7 +605,10 @@ async fn a_second_run_stops_when_the_advisory_lock_is_held() {
     let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 5)]);
 
     // Hold the lock, exactly as a slow run would.
-    let held = db::try_lock(&db.url).await.unwrap().expect("the lock must be free");
+    let held = db::try_lock(&db.url)
+        .await
+        .unwrap()
+        .expect("the lock must be free");
 
     let outcome = run_once(&db, &source, &archive).await.unwrap();
     assert!(
@@ -604,9 +631,11 @@ async fn a_second_run_stops_when_the_advisory_lock_is_held() {
 async fn a_failure_between_the_writes_leaves_no_poll_row_without_its_observation() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     let game = db.game().await.unwrap();
@@ -667,9 +696,11 @@ async fn a_failure_between_the_writes_leaves_no_poll_row_without_its_observation
 #[tokio::test]
 async fn a_failed_archive_write_stops_the_batch_and_marks_the_run_degraded() {
     let db = TestDb::new().await.unwrap();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
 
     // Discover first with a working archive, so the failure under test is the
     // price archive write and nothing else.
@@ -696,9 +727,11 @@ async fn a_failed_archive_write_stops_the_batch_and_marks_the_run_degraded() {
 async fn a_rate_limited_provider_stops_the_run_and_marks_it_degraded() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     make_everything_due(&db.pool).await.unwrap();
@@ -813,7 +846,10 @@ async fn replay_keeps_the_original_runs_verdict_on_a_timestamp() {
     let RunOutcome::Completed { run_id, .. } = outcome else {
         panic!("the run must complete")
     };
-    assert_eq!(db.count("SELECT count(*) FROM market_observations").await, 2);
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        2
+    );
 
     // Move the recorded start back behind the quote. The wall clock has not
     // moved, so the two bounds now disagree, and only one of them can be the one

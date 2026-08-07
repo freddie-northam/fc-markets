@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::db::{self, PollTarget};
 use crate::domain::{Observation, Poll, PollResult, Rejection, names_match, timestamp_in_range};
 use crate::ids::{Platform, PollOutcome, RunId, RunStatus};
-use crate::source::{FetchError, Source};
+use crate::source::{FetchError, ParsedQuote, Source};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -293,12 +293,15 @@ async fn ingest_prices(
             started_at,
         );
         if let Err(e) = runner.archive.put(&key, &envelope).await {
-            tally.degrade(format!("batch {batch} was not archived, so it was not parsed: {e}"));
+            tally.degrade(format!(
+                "batch {batch} was not archived, so it was not parsed: {e}"
+            ));
             continue;
         }
         tally.price_keys.push(key);
 
-        if let Err(e) = ingest_batch(runner, game, run_id, started_at, chunk, &envelope, tally).await
+        if let Err(e) =
+            ingest_batch(runner, game, run_id, started_at, chunk, &envelope, tally).await
         {
             tally.degrade(format!("batch {batch} could not be stored: {e}"));
         }
@@ -324,10 +327,7 @@ async fn ingest_batch(
     let targets =
         db::poll_targets_for(runner.pool, runner.source.name(), game.id, requested).await?;
 
-    let mut by_key: HashMap<(&str, Platform), _> = HashMap::with_capacity(quotes.len());
-    for quote in &quotes {
-        by_key.insert((quote.external_id.as_str(), quote.platform), quote);
-    }
+    let by_key = index_quotes(&quotes);
 
     let polled_at = Utc::now();
     let mut polls = Vec::with_capacity(targets.len());
@@ -450,8 +450,12 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
     }
 
     let game = db::game_by_code(runner.pool, &runner.config.game_code).await?;
-    let (replacement, _) =
-        db::open_run(runner.pool, runner.source.name(), runner.source.parser_version()).await?;
+    let (replacement, _) = db::open_run(
+        runner.pool,
+        runner.source.name(),
+        runner.source.parser_version(),
+    )
+    .await?;
 
     // Everything is read and parsed BEFORE anything is deleted. A failed archive
     // read must leave the ledger exactly as it was.
@@ -472,15 +476,11 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
         )
         .await?;
 
-        let mut by_key: HashMap<(&str, Platform), _> = HashMap::with_capacity(quotes.len());
-        for quote in &quotes {
-            by_key.insert((quote.external_id.as_str(), quote.platform), quote);
-        }
+        let by_key = index_quotes(&quotes);
 
         let mut observations = Vec::new();
         for target in &targets {
-            let Some(quote) = by_key.get(&(target.external_id.as_str(), target.platform))
-            else {
+            let Some(quote) = by_key.get(&(target.external_id.as_str(), target.platform)) else {
                 continue;
             };
             tally.seen += 1;
@@ -527,11 +527,23 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
     Ok(report)
 }
 
+/// Indexes quotes by the pair that identifies one market row.
+///
+/// A repeated pair inside one payload keeps the last quote. A provider that
+/// duplicates a record is stating the same thing twice, and the idempotency index
+/// settles it either way.
+fn index_quotes(quotes: &[ParsedQuote]) -> HashMap<(&str, Platform), &ParsedQuote> {
+    quotes
+        .iter()
+        .map(|q| ((q.external_id.as_str(), q.platform), q))
+        .collect()
+}
+
 /// Applies rules 1, 2 and 3 to one quote.
 fn validate(
     game: &db::Game,
     target: &PollTarget,
-    quote: &crate::source::ParsedQuote,
+    quote: &ParsedQuote,
     started_at: DateTime<Utc>,
 ) -> Result<(i64, DateTime<Utc>), Rejection> {
     // Rule 1. A provider that re-points an existing identifier at a different
