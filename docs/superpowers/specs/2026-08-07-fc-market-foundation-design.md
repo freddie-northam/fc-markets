@@ -1,7 +1,7 @@
 # FC Market Terminal: Foundation Design
 
 Date: 2026-08-07
-Status: Revision 4. Three adversarial review passes are complete.
+Status: Revision 5. Five adversarial review passes are complete.
 Scope: Foundation milestone
 
 ## 1. Mission
@@ -42,7 +42,9 @@ Source selection notes are kept outside this repository.
 | Runtime | One small host that runs always | A ledger with gaps is not a ledger |
 | Raw archive | S3 compatible object storage | One code path, no storage abstraction |
 | Database backup | Nightly `pg_dump` to the same bucket | The database holds identity, so the archive alone cannot rebuild it |
-| Polling | Tiered by rating and rarity | Sources refresh cheap cards slowly |
+| Polling | Tiered by version and rating | Sources refresh cheap cards slowly |
+| Rollups | None | No query reads one, and the market query cannot be one |
+| Alerting | One outward heartbeat | A pull check cannot report that its own host is gone |
 | Crates | One Rust crate | A second crate would have one consumer |
 | API client generation | None yet | Three endpoints do not justify the tools |
 | Valuation | Plain queries over the ledger | Continuous aggregates cannot express them |
@@ -154,8 +156,23 @@ when it parses. We add no dimension tables until a second source proves that we
 need them. Without this rule a source change would silently move assets between
 valuation classes.
 
-`source` is a small enum. `platform` is a small enum. Free text in either column
-lets a provider rename fork an asset's history.
+**Domains.** `source`, `platform`, `position`, `rarity` and `version` are Rust enums
+that serialise to `TEXT`. There is no PostgreSQL enum type, because adding a value
+to one is a migration and a rename is worse. A `CHECK` constraint holds the closed
+list. Free text lets a provider rename fork an asset's history, so the list stays
+closed and each source module maps into it.
+
+- `source`: one value for each provider module.
+- `platform`: `playstation`, `pc`. Add a value when a source separates more.
+- `rarity`: the base tier. `common`, `rare`.
+- `version`: the card variant, including promotional variants. `base`, `totw`,
+  `tots`, `toty`, `icon`, `hero`, `winter_wildcards`, and so on.
+
+**`rarity` and `version` are not the same thing, and `version` matters more.** An
+89-rated Team of the Season card and an 89-rated base rare gold card share a rating
+and a rarity. Late in a game cycle they trade orders of magnitude apart, because
+pack supply accumulates for the base card and does not for the promotional one. Any
+calculation that groups these two together describes neither.
 
 `bid` and `listings` do not appear. No available source supplies them.
 
@@ -232,9 +249,19 @@ retry policy. The next scheduled poll is the retry, and
 list and inserts unseen `(game_id, source, external_id)` pairs. It does not track a
 highest-identifier watermark, because a provider can renumber or backfill records.
 
+**Asset metadata.** On the same slow cadence as discovery, the run fetches card
+attributes for assets that are new, and for assets whose `last_seen_at` is older
+than the metadata cadence. It archives the envelope, maps provider codes to the
+canonical domains in section 4.2, and updates the `assets` row.
+
+This step is not optional. Every valuation input in section 5 reads these columns,
+and Rule 1 compares them against each payload. Without this step they stay null and
+the terminal has nothing to compute.
+
 **Quota.** Each run counts the requests that it issues into `ingest_runs.metadata`
-and stops when it reaches the configured daily budget. An HTTP 429 stops the run
-and marks it `degraded`. It is not a per-record rejection.
+and stops when it reaches the configured daily budget. Discovery and metadata share
+the same budget as prices. An HTTP 429 stops the run and marks it `degraded`. It is
+not a per-record rejection.
 
 ### 4.6 Ingestion rules
 
@@ -248,9 +275,15 @@ Therefore: request one player for each call when a response carries no identifie
 Pay the quota cost. We can recover lost coverage. We cannot recover a silent wrong
 attribution.
 
-When a payload carries identifying attributes, such as a name or a rating, compare
-them against the resolved asset. A mismatch is a rejected record, never a write.
-This catches a provider that re-points an existing identifier at a different card.
+When a payload carries a player name, compare it against the resolved asset. A
+mismatch is a rejected record, never a write. This catches a provider that
+re-points an existing identifier at a different card.
+
+**Do not compare the rating.** Some cards raise their rating during the season by
+design, such as Ones to Watch, Path to Glory and Road to the Knockouts, and EA also
+refreshes ratings mid season. A rating check would reject every such card on every
+poll until the metadata step catches up, and those are high value cards. The name
+is stable where the rating is not.
 
 **Rule 2. Validate `observed_at` before it reaches the hypertable.** Reject any
 value outside `[game.released_at, ingest_runs.started_at + 5 minutes]`. One bad
@@ -275,14 +308,37 @@ database. The archive holds the full payload for anything the sample omits.
 
 The source quota sets asset coverage. Code does not set it.
 
-| Tier | Assets | Interval | Daily cost |
+| Tier | Assets | Interval | Daily requests |
 |---|---|---|---|
-| A, meta and Icons | 50 | 15 min | 4,800 |
-| B, mid | 150 | 1 h | 3,600 |
-| C, fodder and low rated | 400 | 4 h | 2,400 |
+| A | 50 | 15 min | 4,800 |
+| B | 150 | 1 h | 3,600 |
+| C | 400 | 4 h | 2,400 |
 | Total | 600 | | 10,800 |
 
-This is one column and one `WHERE` clause. It is not an abstraction.
+"Daily requests" counts provider requests, not observation rows. A response that
+carries both platforms costs one request and can write two rows.
+
+**Tier assignment.** A tier is a computable predicate on columns that we already
+hold. It is not an editorial judgement:
+
+```sql
+poll_interval_seconds = CASE
+  WHEN version <> 'base' OR rating >= 88 THEN 900     -- A
+  WHEN rating >= 83                      THEN 3600    -- B
+  ELSE                                        14400   -- C
+END
+```
+
+Asset discovery inserts one `asset_poll_state` row for each `(asset, market)` pair
+of a covered asset, with the interval that this expression gives. Nothing else
+creates rows in that table.
+
+The tier expression and the tier sizes must agree. Check the counts against real
+data before the numbers are fixed, because the table above is an estimate made
+with no source available.
+
+This is one column, one expression and one `WHERE` clause. It is not an
+abstraction.
 
 The same column becomes self tuning later. No new structure is needed:
 
@@ -328,22 +384,21 @@ the same compressed batches and no batch can be excluded.
 **Retention.** Never add a retention policy to `market_observations`. The ledger is
 the asset.
 
-**Rollups.** Continuous aggregates form a hierarchy. Raw feeds one hour. One hour
-feeds one day. Build only the intervals that the frontend reads. Each aggregate
-groups by `time_bucket` on the partitioning column.
+**Rollups.** None. We add no continuous aggregate in this milestone.
 
-A rollup cannot fill gaps. TimescaleDB does not permit `time_bucket_gapfill` or
-`locf` inside a continuous aggregate definition. The price endpoint applies both at
-read time.
+No query in this document reads one. The market table query cannot be one, for the
+three reasons in section 5.4. The chart endpoint reads one asset over a bounded
+range, which the read index already serves. At about 8 million rows each year, a
+rollup would optimise a problem that we do not have.
 
-**Backfill.** A refresh policy only materialises a bounded recent window. Rows
-written outside that window record an invalidation that the policy never reaches,
-so the rollup stays silently wrong. Any write outside the policy window must end
-with an explicit call:
+Adding one later also carries a cost that we avoid by waiting. A refresh policy
+only materialises a bounded recent window, so any backfill or replay outside that
+window leaves the rollup silently wrong until somebody calls
+`refresh_continuous_aggregate` by hand. We take that on when a query needs it.
 
-```sql
-CALL refresh_continuous_aggregate(<rollup>, <min observed_at>, <max observed_at>);
-```
+A rollup could not fill gaps in any case. TimescaleDB does not permit
+`time_bucket_gapfill` or `locf` inside a continuous aggregate definition. The chart
+applies both at read time.
 
 **Backup.** A nightly `pg_dump -Fc` writes to the same bucket as the archive, and
 we keep the last 30. The archive alone cannot rebuild the ledger, because identity
@@ -365,16 +420,41 @@ Each run computes checks. A failed check sets `status` to `degraded`:
 A run that dies leaves `status` at `running` forever. The next start finds runs
 with an old `heartbeat_at` and marks them `abandoned`.
 
-**Health.** `GET /health` returns 503 when any of these fail:
+**Health.** `GET /health` returns 503 only when the ledger has stopped:
 
-- the newest observation is older than the largest poll interval
-- an individual asset shows no `written` outcome for longer than its own poll
-  interval
+- no `ingest_polls` row of any outcome is newer than the largest poll interval
 - free space on the data volume is below a fixed threshold
 
-A watchdog can then read one endpoint. The disk check matters because
-`compress_chunk` needs room for a compressed copy before it drops the original, and
-a full volume stops PostgreSQL.
+Read `ingest_polls`, not `market_observations`. The observation table records
+changes only, so a quiet market writes nothing and would look like an outage.
+
+For the same reason, never make a missing `written` outcome a failure condition.
+`written` means the price moved. A card that holds its price produces `unchanged`
+for months, which is correct behaviour, and a check that treats it as a fault sits
+red on a healthy system until somebody stops reading it.
+
+Per-asset staleness belongs in the drift checks above, where it sets `degraded`. It
+does not belong in a signal that pages a human.
+
+The disk check matters because `compress_chunk` needs room for a compressed copy
+before it drops the original, and a full volume stops PostgreSQL.
+
+**Heartbeat.** A pull check on a failing host cannot report that the host is gone.
+This is the only signal that points outward.
+
+When a run closes with status `ok`, the run sends one request to the URL in
+`HEARTBEAT_URL`, which is an external dead man's switch, with a short timeout. A
+failed or slow heartbeat writes a warning. It never changes the run status. When
+`HEARTBEAT_URL` is unset the call is skipped, so tests and local development need
+no external service.
+
+A run that closes `degraded` or `failed` sends no heartbeat. The drift checks
+therefore raise an alarm through the same channel as a dead host.
+
+Set the grace period of the switch above the largest poll interval in section 4.7.
+
+Every service in `docker-compose.yml` sets `restart: unless-stopped`. A host reboot
+must not end the ledger.
 
 **Supervision.** The interval task awaits the join handle of each run. A panic
 becomes a failed run in the log. It never leaves axum serving 200 while ingestion
@@ -421,63 +501,144 @@ Replay re-parses into the existing database and resolves identity through
 `asset_source_ids`. The database is the record of identity, which is why section
 4.8 requires a backup.
 
+### 4.11 Configuration
+
+All configuration comes from environment variables. `main.rs` reads them once into
+a plain `Config` struct and passes it down. There is no configuration crate and no
+configuration file format. A checked-in `.env.example` documents every variable, and
+`docker-compose.yml` supplies the development values.
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection |
+| `OBJECT_STORE_ENDPOINT` | S3 compatible endpoint |
+| `OBJECT_STORE_BUCKET` | Archive and backup bucket |
+| `OBJECT_STORE_ACCESS_KEY` | Object store credential |
+| `OBJECT_STORE_SECRET_KEY` | Object store credential |
+| `SOURCE_API_KEY` | Provider credential, when a provider needs one |
+| `DAILY_REQUEST_BUDGET` | Quota stop in section 4.5 |
+| `HTTP_TIMEOUT_SECONDS` | Request timeout in section 4.5 |
+| `MIN_FREE_DISK_BYTES` | Disk threshold in section 4.9 |
+| `HEARTBEAT_URL` | Dead man's switch in section 4.9. Optional |
+| `API_ROW_CAP` | Server side row cap in section 6 |
+| `NEXT_PUBLIC_API_URL` | The Rust API base URL, read by the web application |
+
+Secrets never enter the repository, the archive, a log line or an `ingest_runs`
+row. The `.env` file stays in `.gitignore`.
+
 ## 5. Valuation engine
 
 Valuation uses hedonic pricing. An asset's fair value is a function of its
 observable attributes. Mispricing is the residual. Property valuation uses the same
-arithmetic. It needs no training data, no labels and no history.
+arithmetic. It needs no training data, no labels and no model.
 
-### 5.1 Stage one: class median. One poll is enough.
+### 5.1 Class median
 
 ```sql
-WITH latest AS (
-  SELECT DISTINCT ON (asset_id) asset_id, price, observed_at
-  FROM market_observations
+-- $1 = market_id
+WITH live AS (
+  SELECT asset_id
+  FROM asset_poll_state
   WHERE market_id = $1
-    AND observed_at > now() - interval '90 days'
-  ORDER BY asset_id, observed_at DESC, source
+    AND consecutive_failures = 0
+    AND last_polled_at > now() - interval '3 days'
+),
+latest AS (
+  SELECT v.asset_id, o.price, o.observed_at, o.min_price, o.max_price
+  FROM live v
+  CROSS JOIN LATERAL (
+    SELECT price, observed_at, min_price, max_price
+    FROM market_observations
+    WHERE market_id = $1 AND asset_id = v.asset_id
+    ORDER BY observed_at DESC, source
+    LIMIT 1
+  ) o
 ),
 buckets AS (
-  SELECT a.rarity, a.rating,
+  SELECT a.rarity, a.version, a.rating,
          percentile_cont(0.5) WITHIN GROUP (ORDER BY l.price) AS median_price,
          count(*) AS n
-  FROM latest l JOIN assets a ON a.id = l.asset_id
-  GROUP BY a.rarity, a.rating
-  HAVING count(*) >= 5
+  FROM latest l
+  JOIN assets a ON a.id = l.asset_id
+  WHERE l.min_price IS NULL OR l.price > l.min_price
+  GROUP BY a.rarity, a.version, a.rating
 )
-SELECT a.name, l.price, b.median_price,
-       l.price / b.median_price AS value_ratio
+SELECT a.name, l.price, b.median_price, b.n,
+       CASE WHEN b.n >= 5 THEN l.price / b.median_price END AS value_ratio,
+       (l.min_price IS NOT NULL AND l.price <= l.min_price) AS at_floor
 FROM latest l
-JOIN assets a  ON a.id = l.asset_id
-JOIN buckets b ON b.rarity = a.rarity AND b.rating = a.rating
-ORDER BY value_ratio;
+JOIN assets  a ON a.id = l.asset_id
+LEFT JOIN buckets b
+       ON b.rarity = a.rarity AND b.version = a.version AND b.rating = a.rating
+ORDER BY at_floor, value_ratio NULLS LAST;
 ```
 
 A `value_ratio` below 1 means the card is cheap for its class.
 
-The time bound is required. Without it no chunk can be excluded and the query reads
-the whole ledger on every render. Choose a window well above the longest expected
-change gap, because the table records changes only and a tight bound would drop
-assets that simply held their price.
+Six decisions in that query each answer a specific failure.
 
-The `source` tiebreak is required. Without it PostgreSQL returns an arbitrary row
-once two sources exist, and the valuation stops being reproducible.
+**The class key includes `version`.** Without it a promotional card and a base card
+of the same rating share a bucket, and the median describes neither. The ratio then
+measures which promotion a card belongs to, not whether it is cheap. This is the
+single most important line in the query.
 
-### 5.2 Stage two: hedonic regression. Use it when buckets hold too few cards.
+**There is no time window on the observations.** The table records changes only, so
+a card that has held one price for months has no recent row. A window would drop
+the illiquid majority, which is 400 of the 600 covered assets, and every remaining
+median would be biased upward. The `LATERAL` lookup takes each asset's newest row
+whenever it was written. It costs one index seek for each covered asset.
 
-Apply ordinary least squares to `log(price)`. The inputs are rating, rarity,
-position, league, the six face statistics and the playstyle count. A QR
-decomposition solves it. The `nalgebra` crate supplies the decomposition in about
-thirty lines. No Python and no new service is needed.
+**Freshness comes from `asset_poll_state`, not from the observation age.** An old
+`observed_at` is ambiguous: the price held, or we have failed to read that card for
+weeks. Section 4.3 exists to resolve exactly this. Without the `live` gate, a dead
+feed keeps voting, and because prices deflate across a cycle its stale value is
+biased high and manufactures false buy signals.
 
-The residual is the mispricing. The coefficients read as plain statements.
+**The join to `buckets` is a `LEFT JOIN` and there is no `HAVING`.** An inner join
+with a count threshold deletes the asset rather than its ratio, and thin buckets are
+exactly the Icons and top promotional cards that carry the volume. The asset now
+always appears. Only the ratio goes null, and `n` is returned so a reader can see
+why.
 
-### 5.3 Stage three: fodder floor.
+**Bound-pinned cards are excluded from the fit and sorted last.** EA sets a minimum
+listing price. A card resting on it holds the lowest ratio in its class by
+construction, so an ascending sort would fill the head of the product's main table
+with cards that are not cheap, only floored.
 
-Compute coins for each rating point that a card contributes. EA publishes the squad
-rating rules. This arithmetic gives an objective floor.
+**The `source` tiebreak is required.** Without it PostgreSQL returns an arbitrary
+row once two sources exist, and the same query gives different answers.
 
-### 5.4 Valuations are queries, not stored facts
+Two honest limits.
+
+The threshold of five is a guess made with no data. Check the real distribution of
+assets for each `(rarity, version, rating)` cell before fixing it, and consider a
+rating band if too many cells stay thin. Do not choose a band width now, because
+price is strongly convex in rating and a width chosen without data would mix
+populations again.
+
+The output ranks a level, not a move. A card that has sat at 0.7 of its class for
+three months and a card that fell to 0.7 last night produce the same number, and
+only the second is a signal. The fix is a second anchor at a lookback date. We do
+not add it now, because with no history a lookback returns nothing. It is the first
+enhancement once the ledger has depth.
+
+### 5.2 Later stages. Not in this milestone.
+
+**Hedonic regression.** Ordinary least squares on `log(price)`, with rating,
+rarity, version, position, league, the six face statistics and the playstyle count
+as inputs. A QR decomposition solves it in about thirty lines. This replaces the
+class median when cells stay thin, because a regression pools across cells and is
+well powered exactly where a per-cell median is not. It also separates a genuinely
+underpriced card from a card that is correctly cheap because it is unusable.
+
+**Fodder floor.** Coins for each rating point that a card contributes, computed
+from EA's published squad rating rules. This gives an objective floor that no
+opinion moves.
+
+Neither is in the build order. Both need real data to be worth writing, and the
+regression adds a dependency that the foundation does not need.
+
+### 5.3 Valuations are queries, not stored facts
 
 A valuation is a function of the ledger and the asset attributes at the time we
 compute it. We run it on demand. There is no results table to maintain.
@@ -485,14 +646,14 @@ compute it. We run it on demand. There is no results table to maintain.
 Two honest limits apply.
 
 A valuation is **not** reproducible for an arbitrary past date. The `assets`
-feature columns are mutable, and a live rating change rewrites the inputs. If exact
-historical reproduction becomes a requirement, `assets` needs validity dating. We
-do not add that now, because nothing needs it yet.
+feature columns are mutable, and EA changes ratings and statistics in season
+through upgrades and Evolutions. If exact historical reproduction becomes a
+requirement, `assets` needs validity dating. We do not add that now.
 
 A valuation **cannot** be a continuous aggregate. TimescaleDB rejects `DISTINCT ON`
 and rejects ordered-set aggregates such as `percentile_cont` in an aggregate
 definition, and it requires a `time_bucket` group on the partitioning column. The
-stage one query fails all three tests.
+query above fails all three tests. This is why section 4.8 builds no rollups.
 
 ## 6. API
 
@@ -532,21 +693,26 @@ No step below depends on a data source.
 1. Create the Rust workspace and the Next.js application. Verify `cargo check` and
    the development server.
 2. Create the Docker Compose file with a pinned PostgreSQL and TimescaleDB image.
-   Verify that the extension loads.
-3. Write the first migration: the tables, the `NOT NULL` columns, the unique
-   constraints and the read index from section 4.2.
-4. Convert the two fact tables to hypertables. Set the compression settings. Verify
+   Set `restart: unless-stopped` on every service. Verify that the extension loads.
+3. Write the `Config` struct and `.env.example` from section 4.11.
+4. Write the first migration: the tables, the `NOT NULL` columns, the `CHECK`
+   domains, the unique constraints and the read index from section 4.2.
+5. Convert the two fact tables to hypertables. Set the compression settings. Verify
    inserts and range queries.
-5. Write the canonical Rust types and the identifier newtypes.
-6. Write the SQLx connection and the smallest set of query functions.
-7. Write the ingest skeleton, the run records, the advisory lock, and the archive
+6. Write the canonical Rust types and the identifier newtypes.
+7. Write the SQLx connection and the smallest set of query functions.
+8. Write the ingest skeleton, the run records, the advisory lock, and the archive
    write and read.
-8. Write the source parser against fixtures.
-9. Add the validation rules from section 4.6.
-10. Add the health checks from section 4.9 and the nightly dump from section 4.8.
-11. Add valuation stage one.
-12. Add the API handlers.
-13. Build the frontend market page, asset page and chart.
+9. Write the source parser against fixtures.
+10. Add asset discovery, the tier expression from section 4.7 and the metadata step
+    from section 4.5. Without this step no asset is ever polled and no valuation
+    input is ever populated.
+11. Add the validation rules from section 4.6.
+12. Add the health checks and the heartbeat from section 4.9, and the nightly dump
+    from section 4.8.
+13. Add the class median query from section 5.1.
+14. Add the API handlers.
+15. Build the frontend market page, asset page and chart.
 
 We do not build the event model, indices, signals, delivery, predictions or
 accounts.
@@ -558,7 +724,10 @@ accounts.
 | Identity | One external identifier always maps to one internal asset |
 | Identity | Two sources map to one internal asset |
 | Identity | The same external identifier in two games maps to two assets |
-| Identity | A payload whose name or rating disagrees with the resolved asset is rejected |
+| Identity | A payload whose name disagrees with the resolved asset is rejected |
+| Identity | A payload whose rating disagrees is accepted, because ratings change in season |
+| Tiers | The tier expression puts every covered asset in exactly one tier |
+| Tiers | Discovery creates one poll state row for each asset and market pair |
 | Idempotency | One payload ingested twice does not double the observation count |
 | Idempotency | The unique constraint still rejects a duplicate after chunk compression |
 | Restatement | A different price at the same timestamp lands as a second row |
@@ -575,8 +744,15 @@ accounts.
 | Archive | A failed archive write stops the batch and marks the run degraded |
 | Valuation | The class median ratio is stable and reproducible on fixed input |
 | Valuation | Two sources at one timestamp give a deterministic result |
+| Valuation | A promotional card and a base card of one rating fall in separate classes |
+| Valuation | An asset in a class below the threshold appears with a null ratio, never 1.0 |
+| Valuation | An asset whose last price is months old still appears, because the ledger records changes only |
+| Valuation | An asset with failing polls is excluded, and its stale price leaves the median |
+| Valuation | A card at its minimum price does not lead the cheap list |
 | API | Observations return in chronological order and respect the row cap |
-| Health | A stale ledger makes `/health` return 503 |
+| Health | A stopped ledger makes `/health` return 503 |
+| Health | A market where no price moves keeps `/health` at 200 |
+| Health | A degraded run sends no heartbeat |
 | Raw replay | A saved fixture parses again with no network |
 
 The compiler enforces provider isolation, because the provider structs stay private
