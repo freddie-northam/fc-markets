@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
+import { MarketNav } from "@/components/market-nav";
 import {
   Table,
   TableBody,
@@ -35,21 +36,11 @@ export default async function MarketPage({
             version, same rating. A ratio below 1 is cheap for its class.
           </p>
         </div>
-        <nav className="flex gap-1.5">
-          {markets.map((m) => (
-            <Link
-              key={m.id}
-              href={`/?market=${m.id}`}
-              className={
-                m.id === market.id
-                  ? "rounded border border-neutral-600 bg-neutral-800 px-2.5 py-1 text-xs"
-                  : "rounded border border-neutral-800 px-2.5 py-1 text-xs text-neutral-400 hover:text-neutral-200"
-              }
-            >
-              {m.platform}
-            </Link>
-          ))}
-        </nav>
+        <MarketNav
+          markets={markets}
+          currentId={market.id}
+          hrefFor={(id) => `/?market=${id}`}
+        />
       </div>
 
       {rows.length === 0 ? (

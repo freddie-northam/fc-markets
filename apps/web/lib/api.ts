@@ -46,13 +46,20 @@ export type ClassValue = {
   at_floor: boolean;
 };
 
+/** Thrown when the API answers, but not with success. */
+export class ApiError extends Error {
+  constructor(readonly status: number, path: string) {
+    super(`${path} returned ${status}`);
+  }
+}
+
 async function get<T>(path: string): Promise<T> {
   const response = await fetch(`${BASE}${path}`, {
     // Live ledger data. Nothing here may be served from a build-time cache.
     cache: "no-store",
   });
   if (!response.ok) {
-    throw new Error(`${path} returned ${response.status}`);
+    throw new ApiError(response.status, path);
   }
   return (await response.json()) as T;
 }
@@ -62,17 +69,19 @@ export function getMarkets(): Promise<Market[]> {
 }
 
 export function getAsset(id: string): Promise<Asset> {
-  return get<Asset>(`/assets/${id}`);
+  return get<Asset>(`/assets/${encodeURIComponent(id)}`);
 }
 
 export function getValuations(marketId: string): Promise<ClassValue[]> {
-  return get<ClassValue[]>(`/markets/${marketId}/valuations`);
+  return get<ClassValue[]>(`/markets/${encodeURIComponent(marketId)}/valuations`);
 }
 
 export function getPrices(assetId: string, marketId: string): Promise<PricePoint[]> {
   // The market is always supplied. A card trades independently on each platform,
   // so a series that mixes two markets is not a price history.
-  return get<PricePoint[]>(`/assets/${assetId}/prices?market=${marketId}`);
+  return get<PricePoint[]>(
+    `/assets/${encodeURIComponent(assetId)}/prices?market=${encodeURIComponent(marketId)}`,
+  );
 }
 
 /** Coins, grouped for readability. Prices reach eight figures. */
