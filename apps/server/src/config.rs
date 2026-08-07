@@ -55,7 +55,9 @@ impl Config {
             daily_request_budget: num("DAILY_REQUEST_BUDGET", 18_000)?,
             http_timeout: Duration::from_secs(num("HTTP_TIMEOUT_SECONDS", 30)?),
             min_free_disk_bytes: num("MIN_FREE_DISK_BYTES", 5 * 1024 * 1024 * 1024)?,
-            heartbeat_url: std::env::var("HEARTBEAT_URL").ok().filter(|s| !s.is_empty()),
+            heartbeat_url: std::env::var("HEARTBEAT_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
             api_row_cap: num("API_ROW_CAP", 5_000)?,
             bind_address: opt("BIND_ADDRESS", "0.0.0.0:8090"),
             game_code: opt("GAME_CODE", "FC26"),

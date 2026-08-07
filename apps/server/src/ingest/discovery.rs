@@ -37,7 +37,14 @@ pub(crate) async fn maybe_discover(
     tally: &mut Tally,
 ) -> Result<()> {
     let source = runner.source.name();
-    if !is_due(runner, source, DISCOVERY_STEP, runner.config.discovery_cadence_seconds).await? {
+    if !is_due(
+        runner,
+        source,
+        DISCOVERY_STEP,
+        runner.config.discovery_cadence_seconds,
+    )
+    .await?
+    {
         return Ok(());
     }
     if !budget.take() {
@@ -60,9 +67,17 @@ pub(crate) async fn maybe_discover(
 
     // Archive before parse, exactly as for prices. The asset list is what decides
     // which cards exist at all, so a change in it must stay auditable.
-    let key = object_key(source, Kind::AssetList, &run_id.to_string(), 0, envelope.fetched_at);
+    let key = object_key(
+        source,
+        Kind::AssetList,
+        &run_id.to_string(),
+        0,
+        envelope.fetched_at,
+    );
     if let Err(e) = runner.archive.put(&key, &envelope).await {
-        tally.degrade(format!("the asset list was not archived, so it was not parsed: {e}"));
+        tally.degrade(format!(
+            "the asset list was not archived, so it was not parsed: {e}"
+        ));
         return Ok(());
     }
 
@@ -112,7 +127,14 @@ pub(crate) async fn maybe_refresh_metadata(
     tally: &mut Tally,
 ) -> Result<()> {
     let source = runner.source.name();
-    if !is_due(runner, source, METADATA_STEP, runner.config.metadata_cadence_seconds).await? {
+    if !is_due(
+        runner,
+        source,
+        METADATA_STEP,
+        runner.config.metadata_cadence_seconds,
+    )
+    .await?
+    {
         return Ok(());
     }
 
@@ -203,7 +225,8 @@ pub(crate) async fn maybe_refresh_metadata(
 /// decision, not a code decision: section 4.7 sets it from what the source
 /// allows, and the tier expression then spends it.
 pub async fn apply_coverage(runner: &Runner<'_>, game: &db::Game) -> Result<()> {
-    let covered = db::most_valuable_assets(runner.pool, game.id, runner.config.asset_coverage).await?;
+    let covered =
+        db::most_valuable_assets(runner.pool, game.id, runner.config.asset_coverage).await?;
     let markets = db::markets_for_game(runner.pool, game.id).await?;
 
     for asset in &covered {
@@ -225,7 +248,12 @@ pub async fn apply_coverage(runner: &Runner<'_>, game: &db::Game) -> Result<()> 
 }
 
 /// True when a slow step has not run inside its cadence.
-async fn is_due(runner: &Runner<'_>, source: &str, step: &str, cadence_seconds: i64) -> Result<bool> {
+async fn is_due(
+    runner: &Runner<'_>,
+    source: &str,
+    step: &str,
+    cadence_seconds: i64,
+) -> Result<bool> {
     let since = db::seconds_since_step(runner.pool, source, step).await?;
     Ok(match since {
         None => true,

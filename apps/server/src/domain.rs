@@ -172,8 +172,7 @@ pub fn timestamp_in_range(
     game_released_at: DateTime<Utc>,
     run_started_at: DateTime<Utc>,
 ) -> bool {
-    observed_at >= game_released_at
-        && observed_at <= run_started_at + chrono::Duration::minutes(5)
+    observed_at >= game_released_at && observed_at <= run_started_at + chrono::Duration::minutes(5)
 }
 
 #[cfg(test)]
@@ -212,22 +211,38 @@ mod tests {
     fn rejects_a_timestamp_from_before_the_game_existed() {
         let released = ts("2025-09-26T00:00:00Z");
         let run = ts("2026-08-07T12:00:00Z");
-        assert!(!timestamp_in_range(ts("2024-01-01T00:00:00Z"), released, run));
+        assert!(!timestamp_in_range(
+            ts("2024-01-01T00:00:00Z"),
+            released,
+            run
+        ));
     }
 
     #[test]
     fn rejects_a_timestamp_far_in_the_future() {
         let released = ts("2025-09-26T00:00:00Z");
         let run = ts("2026-08-07T12:00:00Z");
-        assert!(!timestamp_in_range(ts("2087-01-01T00:00:00Z"), released, run));
+        assert!(!timestamp_in_range(
+            ts("2087-01-01T00:00:00Z"),
+            released,
+            run
+        ));
     }
 
     #[test]
     fn accepts_a_small_clock_skew_ahead_of_the_run() {
         let released = ts("2025-09-26T00:00:00Z");
         let run = ts("2026-08-07T12:00:00Z");
-        assert!(timestamp_in_range(ts("2026-08-07T12:03:00Z"), released, run));
-        assert!(!timestamp_in_range(ts("2026-08-07T12:07:00Z"), released, run));
+        assert!(timestamp_in_range(
+            ts("2026-08-07T12:03:00Z"),
+            released,
+            run
+        ));
+        assert!(!timestamp_in_range(
+            ts("2026-08-07T12:07:00Z"),
+            released,
+            run
+        ));
     }
 
     #[test]

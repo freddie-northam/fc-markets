@@ -53,7 +53,9 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
         Err(e) => reasons.push(format!("cannot read poll history: {e}")),
         Ok(None) => {} // Nothing polled yet. A fresh install is not a fault.
         Ok(Some(age)) => {
-            let limit = db::largest_poll_interval_seconds(&s.pool).await.unwrap_or(14_400);
+            let limit = db::largest_poll_interval_seconds(&s.pool)
+                .await
+                .unwrap_or(14_400);
             if age > f64::from(limit) {
                 reasons.push(format!("no poll for {age:.0}s, limit {limit}s"));
             }
@@ -65,11 +67,18 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
     {
         // Compression needs room for a compressed copy before it drops the
         // original, and a full volume stops PostgreSQL outright.
-        reasons.push(format!("free disk {free} below {}", s.config.min_free_disk_bytes));
+        reasons.push(format!(
+            "free disk {free} below {}",
+            s.config.min_free_disk_bytes
+        ));
     }
 
     let ok = reasons.is_empty();
-    let code = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let code = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (code, Json(Health { ok, reasons }))
 }
 
@@ -213,7 +222,10 @@ impl axum::response::IntoResponse for ApiError {
             // The caller gets a readable sentence, the operator gets the detail.
             Self::Internal(detail) => {
                 tracing::error!(%detail, "request failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "the server could not complete this request".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the server could not complete this request".to_string(),
+                )
             }
         };
         (code, Json(serde_json::json!({ "error": message }))).into_response()
@@ -240,7 +252,12 @@ fn free_disk_bytes(path: &str) -> Option<u64> {
         return None;
     }
     let buf = unsafe { buf.assume_init() };
-    Some(u64::from(buf.f_bavail).saturating_mul(u64::from(buf.f_frsize)))
+    // `as` rather than `from`: these widths are platform dependent, so only a
+    // cast compiles everywhere, and widening never truncates. Whichever of the
+    // two is already u64 on the host makes its own cast redundant there, which
+    // is what the allow covers.
+    #[allow(clippy::unnecessary_cast)]
+    Some((buf.f_bavail as u64).saturating_mul(buf.f_frsize as u64))
 }
 
 #[cfg(test)]

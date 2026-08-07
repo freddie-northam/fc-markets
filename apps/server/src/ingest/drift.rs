@@ -38,7 +38,12 @@ const FROZEN_AFTER_HOURS: f64 = 24.0;
 const MAX_MEDIAN_MOVE: f64 = 3.0;
 
 /// Every check that fired. An empty result means the run looks healthy.
-pub async fn checks(pool: &PgPool, run_id: RunId, seen: i32, rejected_no_price: i32) -> Result<Vec<String>> {
+pub async fn checks(
+    pool: &PgPool,
+    run_id: RunId,
+    seen: i32,
+    rejected_no_price: i32,
+) -> Result<Vec<String>> {
     let mut failed = Vec::new();
 
     if seen > 0 {
@@ -155,7 +160,7 @@ async fn distribution_shift(
         // Nothing to compare against yet. A first run is not a drift.
         return Ok(None);
     };
-    if ratio > MAX_MEDIAN_MOVE || ratio < 1.0 / MAX_MEDIAN_MOVE {
+    if !(1.0 / MAX_MEDIAN_MOVE..=MAX_MEDIAN_MOVE).contains(&ratio) {
         return Ok(Some(format!(
             "the median asset moved by a factor of {ratio:.2}, limit {MAX_MEDIAN_MOVE:.0}"
         )));

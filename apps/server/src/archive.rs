@@ -177,7 +177,11 @@ impl S3Archive {
 
         while let Some(page) = pages.next().await {
             let page = page.with_context(|| format!("cannot list {prefix}"))?;
-            keys.extend(page.contents().iter().filter_map(|o| o.key().map(String::from)));
+            keys.extend(
+                page.contents()
+                    .iter()
+                    .filter_map(|o| o.key().map(String::from)),
+            );
         }
         Ok(keys)
     }

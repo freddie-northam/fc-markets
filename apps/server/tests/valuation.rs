@@ -335,7 +335,16 @@ async fn a_valuation_covers_one_market_only() {
     let playstation = db.market(Platform::Playstation).await.unwrap();
     let pc = db.market(Platform::Pc).await.unwrap();
 
-    live_card(&db, playstation, "Only on PlayStation", 84, "base", 9_000, Some(200)).await;
+    live_card(
+        &db,
+        playstation,
+        "Only on PlayStation",
+        84,
+        "base",
+        9_000,
+        Some(200),
+    )
+    .await;
 
     assert_eq!(value(&db, playstation).await.len(), 1);
     assert!(value(&db, pc).await.is_empty());

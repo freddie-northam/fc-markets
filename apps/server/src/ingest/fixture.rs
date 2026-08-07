@@ -143,7 +143,10 @@ impl Source for FixtureSource {
     }
 
     async fn fetch_prices(&self, external_ids: &[String]) -> FetchResult {
-        let body = self.read_json("prices.json").await.map_err(FetchError::Other)?;
+        let body = self
+            .read_json("prices.json")
+            .await
+            .map_err(FetchError::Other)?;
         Ok(Envelope::new(
             self.url("prices.json"),
             external_ids.to_vec(),
@@ -158,10 +161,8 @@ impl Source for FixtureSource {
         let mut out = Vec::with_capacity(records.len() * 2);
 
         for r in records {
-            for (platform, quote) in [
-                (Platform::Playstation, r.playstation),
-                (Platform::Pc, r.pc),
-            ] {
+            for (platform, quote) in [(Platform::Playstation, r.playstation), (Platform::Pc, r.pc)]
+            {
                 let Some(q) = quote else { continue };
                 out.push(ParsedQuote {
                     external_id: r.id.clone(),
@@ -178,7 +179,10 @@ impl Source for FixtureSource {
     }
 
     async fn fetch_asset_list(&self) -> FetchResult {
-        let body = self.read_json("assets.json").await.map_err(FetchError::Other)?;
+        let body = self
+            .read_json("assets.json")
+            .await
+            .map_err(FetchError::Other)?;
         Ok(Envelope::new(
             self.url("assets.json"),
             Vec::new(),
@@ -200,7 +204,10 @@ impl Source for FixtureSource {
     }
 
     async fn fetch_metadata(&self, external_ids: &[String]) -> FetchResult {
-        let body = self.read_json("metadata.json").await.map_err(FetchError::Other)?;
+        let body = self
+            .read_json("metadata.json")
+            .await
+            .map_err(FetchError::Other)?;
         Ok(Envelope::new(
             self.url("metadata.json"),
             external_ids.to_vec(),
