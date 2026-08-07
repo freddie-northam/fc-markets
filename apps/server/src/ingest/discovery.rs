@@ -229,21 +229,25 @@ pub async fn apply_coverage(runner: &Runner<'_>, game: &db::Game) -> Result<()> 
         db::most_valuable_assets(runner.pool, game.id, runner.config.asset_coverage).await?;
     let markets = db::markets_for_game(runner.pool, game.id).await?;
 
+    let mut rows = Vec::with_capacity(covered.len() * markets.len());
     for asset in &covered {
         // One definition of the tier expression, in Rust, where the unit tests
         // cover it. A second copy in SQL would drift from this one in silence.
         let interval = poll_interval_seconds(&asset.version, asset.rating);
-        for (market, _platform) in &markets {
-            db::ensure_poll_state(runner.pool, asset.id, *market, interval).await?;
-        }
+        rows.extend(
+            markets
+                .iter()
+                .map(|(market, _)| (asset.id, *market, interval)),
+        );
     }
+    let added = db::ensure_poll_state(runner.pool, &rows).await?;
 
     // An asset that has dropped out of the covered set stops being polled. Its
     // history and its coverage record stay, and the quota frees immediately.
     let ids: Vec<_> = covered.iter().map(|a| a.id.0).collect();
     let dropped = db::drop_poll_state_outside(runner.pool, game.id, &ids).await?;
 
-    info!(covered = covered.len(), dropped, "coverage applied");
+    info!(covered = covered.len(), added, dropped, "coverage applied");
     Ok(())
 }
 
