@@ -143,11 +143,15 @@ const STALE_AFTER_MS: u64 = 30 * 60 * 1000;
 /// are the creation time in milliseconds. Dropping by age rather than by "has no
 /// connections" is what makes this safe to run while other tests are in flight.
 async fn sweep_stale_databases(admin: &PgPool) {
-    let names: Vec<String> =
-        sqlx::query_scalar("SELECT datname FROM pg_database WHERE datname ~ '^fcm_test_'")
-            .fetch_all(admin)
-            .await
-            .unwrap_or_default();
+    let names: Vec<String> = sqlx::query_scalar(
+        // Anchored and fully specified: the name is interpolated into a
+        // DROP below, and this is what guarantees it holds nothing but the
+        // prefix and 32 hex digits we generate.
+        "SELECT datname FROM pg_database WHERE datname ~ '^fcm_test_[0-9a-f]{32}$'",
+    )
+    .fetch_all(admin)
+    .await
+    .unwrap_or_default();
 
     let now = Utc::now().timestamp_millis().max(0) as u64;
     for name in names {

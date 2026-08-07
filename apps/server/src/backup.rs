@@ -73,6 +73,15 @@ pub async fn run(
 /// parse we do not understand would be worse than the exposure.
 fn split_password(database_url: &str) -> (String, Option<String>) {
     let Ok(mut url) = url::Url::parse(database_url) else {
+        // libpq also accepts "host=... password=...", which parses as nothing
+        // here and would then travel on the argv this function exists to keep
+        // it off. Say so rather than silently reverting to the exposure.
+        if database_url.contains("password=") {
+            tracing::warn!(
+                "DATABASE_URL is in libpq keyword form, so the password cannot be moved out \
+                 of the pg_dump arguments; use a postgres:// URL to keep it off the process list"
+            );
+        }
         return (database_url.to_string(), None);
     };
     let Some(password) = url.password().map(str::to_string) else {

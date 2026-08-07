@@ -157,7 +157,9 @@ impl Source for FixtureSource {
     }
 
     fn parse_prices(&self, envelope: &Envelope) -> Result<Vec<ParsedQuote>> {
-        let records: Vec<PriceRecord> = serde_json::from_value(envelope.body.clone())?;
+        // Borrowed, not cloned: from_value would deep-copy the whole payload,
+        // and this runs on every batch of every run and again on replay.
+        let records: Vec<PriceRecord> = Vec::deserialize(&envelope.body)?;
         let mut out = Vec::with_capacity(records.len() * 2);
 
         for r in records {
@@ -193,7 +195,9 @@ impl Source for FixtureSource {
     }
 
     fn parse_asset_list(&self, envelope: &Envelope) -> Result<Vec<Listing>> {
-        let records: Vec<ListingRecord> = serde_json::from_value(envelope.body.clone())?;
+        // Borrowed, not cloned: from_value would deep-copy the whole payload,
+        // and this runs on every batch of every run and again on replay.
+        let records: Vec<ListingRecord> = Vec::deserialize(&envelope.body)?;
         Ok(records
             .into_iter()
             .map(|r| Listing {
@@ -221,7 +225,9 @@ impl Source for FixtureSource {
     /// the edge, is what stops a provider change from silently moving assets
     /// between valuation classes.
     fn parse_metadata(&self, envelope: &Envelope) -> Result<Vec<AssetAttributes>> {
-        let records: Vec<MetadataRecord> = serde_json::from_value(envelope.body.clone())?;
+        // Borrowed, not cloned: from_value would deep-copy the whole payload,
+        // and this runs on every batch of every run and again on replay.
+        let records: Vec<MetadataRecord> = Vec::deserialize(&envelope.body)?;
 
         Ok(records
             .into_iter()

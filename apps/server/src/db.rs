@@ -11,6 +11,11 @@ use uuid::Uuid;
 /// request budget twice and race on poll state.
 const INGEST_LOCK: i64 = 0x0000_FC1A_55E7;
 
+/// The interval assumed when no asset has one yet. It is the slowest tier, so a
+/// health check falling back to it waits the longest before crying outage. One
+/// definition, because the scheduler and the health check must agree on it.
+pub const DEFAULT_POLL_INTERVAL_SECONDS: i32 = 14_400;
+
 /// How long a run may go without a heartbeat before the next start declares it
 /// dead. A run that dies leaves its status at `running` for ever, which makes the
 /// open-run count meaningless.
@@ -183,12 +188,17 @@ pub async fn close_run(
 /// A killed process leaves a run marked running for ever, which would make the
 /// open-run count meaningless. The next start clears them.
 pub async fn reap_abandoned_runs(pool: &PgPool) -> Result<u64> {
-    let r = sqlx::query(&format!(
+    // Bound, not interpolated. The value is a constant so nothing could be
+    // injected through it, but this was the one query in the server built by
+    // string formatting, and that is the shape somebody copies next time with a
+    // value that did come from outside.
+    let r = sqlx::query(
         "UPDATE ingest_runs
             SET status = 'abandoned', finished_at = now()
           WHERE status = 'running'
-            AND heartbeat_at < now() - INTERVAL '{ABANDON_AFTER}'"
-    ))
+            AND heartbeat_at < now() - $1::interval",
+    )
+    .bind(ABANDON_AFTER)
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
@@ -762,11 +772,12 @@ pub async fn newest_poll_age_seconds(pool: &PgPool) -> Result<Option<f64>> {
 }
 
 pub async fn largest_poll_interval_seconds(pool: &PgPool) -> Result<i32> {
-    Ok(sqlx::query_scalar(
-        "SELECT COALESCE(max(poll_interval_seconds), 14400) FROM asset_poll_state",
+    Ok(
+        sqlx::query_scalar("SELECT COALESCE(max(poll_interval_seconds), $1) FROM asset_poll_state")
+            .bind(DEFAULT_POLL_INTERVAL_SECONDS)
+            .fetch_one(pool)
+            .await?,
     )
-    .fetch_one(pool)
-    .await?)
 }
 
 // ---------------------------------------------------------------------------
@@ -836,26 +847,25 @@ pub async fn resolve_targets(
     to_targets(rows)
 }
 
-/// The archive keys one run wrote, in the order it wrote them. Replay re-reads
-/// exactly these.
-pub async fn run_archive_keys(pool: &PgPool, run_id: RunId) -> Result<Vec<String>> {
-    let keys: Option<serde_json::Value> =
-        sqlx::query_scalar("SELECT metadata->'price_keys' FROM ingest_runs WHERE id = $1")
+/// What replay needs about the run it re-parses: when it started, and which
+/// payloads it archived.
+///
+/// One row, one query. Rule 2 bounds timestamps against the ORIGINAL start, so
+/// these two facts are only ever wanted together.
+pub async fn run_replay_source(
+    pool: &PgPool,
+    run_id: RunId,
+) -> Result<Option<(DateTime<Utc>, Vec<String>)>> {
+    let row: Option<(DateTime<Utc>, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT started_at, metadata->'price_keys' FROM ingest_runs WHERE id = $1")
             .bind(run_id.0)
             .fetch_optional(pool)
-            .await?
-            .flatten();
+            .await?;
 
-    Ok(keys
-        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
-        .unwrap_or_default())
-}
-
-pub async fn run_started_at(pool: &PgPool, run_id: RunId) -> Result<Option<DateTime<Utc>>> {
-    Ok(
-        sqlx::query_scalar("SELECT started_at FROM ingest_runs WHERE id = $1")
-            .bind(run_id.0)
-            .fetch_optional(pool)
-            .await?,
-    )
+    Ok(row.map(|(started_at, keys)| {
+        let keys = keys
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+            .unwrap_or_default();
+        (started_at, keys)
+    }))
 }
