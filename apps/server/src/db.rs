@@ -1,14 +1,20 @@
-use crate::domain::Observation;
-use crate::ids::{AssetId, MarketId, PollOutcome, RunId, RunStatus};
-use anyhow::Result;
+use crate::domain::{AssetAttributes, Observation, Poll, PollResult};
+use crate::ids::{AssetId, GameId, MarketId, Platform, PlayerId, PollOutcome, RunId, RunStatus};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// One lock identifier for the whole ingest path. The serve loop and the CLI
 /// share one entry point, so without this a slow run and a manual run spend the
 /// request budget twice and race on poll state.
 const INGEST_LOCK: i64 = 0x0FC_1_A5_5E7;
+
+/// How long a run may go without a heartbeat before the next start declares it
+/// dead. A run that dies leaves its status at `running` for ever, which makes the
+/// open-run count meaningless.
+const ABANDON_AFTER: &str = "1 hour";
 
 pub async fn connect(url: &str) -> Result<PgPool> {
     Ok(PgPoolOptions::new()
@@ -23,52 +29,148 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Returns None when another run already holds the lock. The caller logs and
-/// stops rather than waiting, because the next scheduled tick is the retry.
-pub async fn try_lock(pool: &PgPool) -> Result<Option<sqlx::pool::PoolConnection<Postgres>>> {
-    let mut conn = pool.acquire().await?;
-    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(INGEST_LOCK)
-        .fetch_one(&mut *conn)
-        .await?;
-    Ok(if got { Some(conn) } else { None })
+/// Holds the ingest advisory lock for the length of a run.
+///
+/// It owns a dedicated connection rather than a pooled one. `pg_advisory_lock`
+/// is scoped to a SESSION, and returning a pooled connection does not end its
+/// session: the lock would survive the run and every later run in the same
+/// process would find itself locked out for ever. Ending the connection ends the
+/// session, so the lock goes even if the run panics.
+pub struct IngestLock {
+    conn: sqlx::PgConnection,
 }
 
-pub async fn open_run(pool: &PgPool, source: &str, parser_version: &str) -> Result<RunId> {
+impl IngestLock {
+    /// Releases the lock promptly. Dropping the guard also releases it, because
+    /// the session dies with the connection, but that path is the panic
+    /// backstop rather than the normal one.
+    pub async fn release(self) {
+        use sqlx::Connection;
+        let _ = self.conn.close().await;
+    }
+}
+
+/// Returns None when another run already holds the lock. The caller logs and
+/// stops rather than waiting, because the next scheduled tick is the retry.
+pub async fn try_lock(database_url: &str) -> Result<Option<IngestLock>> {
+    use sqlx::Connection;
+
+    let mut conn = sqlx::PgConnection::connect(database_url).await?;
+    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(INGEST_LOCK)
+        .fetch_one(&mut conn)
+        .await?;
+
+    if !got {
+        let _ = conn.close().await;
+        return Ok(None);
+    }
+    Ok(Some(IngestLock { conn }))
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+pub struct Game {
+    pub id: GameId,
+    pub released_at: DateTime<Utc>,
+}
+
+/// Rule 2 needs `released_at` as its lower bound, so every run loads the game
+/// before it validates anything.
+pub async fn game_by_code(pool: &PgPool, code: &str) -> Result<Game> {
+    let (id, released_at): (Uuid, DateTime<Utc>) =
+        sqlx::query_as("SELECT id, released_at FROM games WHERE code = $1")
+            .bind(code)
+            .fetch_optional(pool)
+            .await?
+            .with_context(|| format!("no game with code {code}; run the migrations"))?;
+    Ok(Game {
+        id: GameId(id),
+        released_at,
+    })
+}
+
+pub async fn markets_for_game(pool: &PgPool, game: GameId) -> Result<Vec<(MarketId, Platform)>> {
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, platform FROM markets WHERE game_id = $1 ORDER BY platform")
+            .bind(game.0)
+            .fetch_all(pool)
+            .await?;
+    rows.into_iter()
+        .map(|(id, raw)| Ok((MarketId(id), platform(&raw)?)))
+        .collect()
+}
+
+/// The `CHECK` constraint on `markets.platform` holds the closed list, so an
+/// unknown value here means the constraint was dropped. Failing loudly beats
+/// dropping the market and quietly halving our coverage.
+fn platform(raw: &str) -> Result<Platform> {
+    Platform::parse(raw).with_context(|| format!("markets holds an unknown platform: {raw}"))
+}
+
+// ---------------------------------------------------------------------------
+// Runs
+// ---------------------------------------------------------------------------
+
+/// Returns the run's own start alongside its identifier. Rule 2 bounds
+/// timestamps against this value rather than the wall clock, so replaying one
+/// archive twice gives the same table.
+pub async fn open_run(pool: &PgPool, source: &str, parser_version: &str) -> Result<(RunId, DateTime<Utc>)> {
     let id = RunId::new();
-    sqlx::query(
+    let started_at: DateTime<Utc> = sqlx::query_scalar(
         "INSERT INTO ingest_runs (id, source, parser_version, heartbeat_at)
-         VALUES ($1, $2, $3, now())",
+         VALUES ($1, $2, $3, now())
+         RETURNING started_at",
     )
     .bind(id.0)
     .bind(source)
     .bind(parser_version)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
-    Ok(id)
+    Ok((id, started_at))
+}
+
+/// A long run must show that it is alive, or the reaper below would declare it
+/// abandoned while it is still working.
+pub async fn touch_heartbeat(pool: &PgPool, id: RunId) -> Result<()> {
+    sqlx::query("UPDATE ingest_runs SET heartbeat_at = now() WHERE id = $1")
+        .bind(id.0)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunCounts {
+    pub seen: i32,
+    pub written: i32,
+    pub rejected: i32,
 }
 
 pub async fn close_run(
     pool: &PgPool,
     id: RunId,
     status: RunStatus,
-    seen: i32,
-    written: i32,
-    rejected: i32,
+    counts: RunCounts,
     error: Option<&str>,
+    metadata: serde_json::Value,
 ) -> Result<()> {
     sqlx::query(
         "UPDATE ingest_runs
             SET finished_at = now(), status = $2, records_seen = $3,
-                records_written = $4, records_rejected = $5, error = $6
+                records_written = $4, records_rejected = $5, error = $6,
+                metadata = metadata || $7::jsonb
           WHERE id = $1",
     )
     .bind(id.0)
     .bind(status.as_str())
-    .bind(seen)
-    .bind(written)
-    .bind(rejected)
+    .bind(counts.seen)
+    .bind(counts.written)
+    .bind(counts.rejected)
     .bind(error)
+    .bind(metadata)
     .execute(pool)
     .await?;
     Ok(())
@@ -77,117 +179,182 @@ pub async fn close_run(
 /// A killed process leaves a run marked running for ever, which would make the
 /// open-run count meaningless. The next start clears them.
 pub async fn reap_abandoned_runs(pool: &PgPool) -> Result<u64> {
-    let r = sqlx::query(
+    let r = sqlx::query(&format!(
         "UPDATE ingest_runs
             SET status = 'abandoned', finished_at = now()
           WHERE status = 'running'
-            AND heartbeat_at < now() - INTERVAL '1 hour'",
-    )
+            AND heartbeat_at < now() - INTERVAL '{ABANDON_AFTER}'"
+    ))
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
 }
 
-pub struct DueAsset {
+/// The budget is daily, so it must count what every run has already spent today,
+/// not what this run has spent. A per-run count would let twelve runs spend
+/// twelve budgets.
+pub async fn requests_spent_today(pool: &PgPool, source: &str) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(sum((metadata->>'requests')::bigint), 0)::bigint
+           FROM ingest_runs
+          WHERE source = $1 AND started_at >= date_trunc('day', now())",
+    )
+    .bind(source)
+    .fetch_one(pool)
+    .await?)
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling
+// ---------------------------------------------------------------------------
+
+/// One asset, one market, and the identifier the source knows it by.
+pub struct PollTarget {
     pub asset_id: AssetId,
     pub market_id: MarketId,
     pub external_id: String,
+    pub platform: Platform,
     pub name: String,
 }
 
-pub async fn due_assets(
+/// The identifiers that are due, not the (asset, market) pairs.
+///
+/// A request returns every platform at once, so the budget is spent per
+/// identifier. Selecting pairs here would count one request twice.
+pub async fn due_external_ids(
     pool: &PgPool,
     source: &str,
+    game: GameId,
     limit: i64,
-) -> Result<Vec<DueAsset>> {
-    let rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
-        "SELECT s.asset_id, s.market_id, si.external_id, a.name
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT DISTINCT ON (si.external_id) si.external_id
            FROM asset_poll_state s
            JOIN assets a ON a.id = s.asset_id
            JOIN asset_source_ids si
-             ON si.asset_id = s.asset_id AND si.source = $1
-          WHERE s.last_polled_at IS NULL
-             OR s.last_polled_at + make_interval(secs => s.poll_interval_seconds) < now()
-          ORDER BY s.last_polled_at NULLS FIRST
-          LIMIT $2",
+             ON si.asset_id = s.asset_id AND si.source = $1 AND si.game_id = a.game_id
+          WHERE a.game_id = $2
+            AND (s.last_polled_at IS NULL
+                 OR s.last_polled_at + make_interval(secs => s.poll_interval_seconds) <= now())
+          ORDER BY si.external_id, s.last_polled_at NULLS FIRST
+          LIMIT $3",
     )
     .bind(source)
+    .bind(game.0)
     .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Every (asset, market) pair behind the requested identifiers, due or not.
+///
+/// One response carries every platform. Recording only the pairs that were due
+/// would throw away a price we have already paid for and would leave the
+/// coverage record claiming we did not look.
+pub async fn poll_targets_for(
+    pool: &PgPool,
+    source: &str,
+    game: GameId,
+    external_ids: &[String],
+) -> Result<Vec<PollTarget>> {
+    let rows: Vec<(Uuid, Uuid, String, String, String)> = sqlx::query_as(
+        "SELECT s.asset_id, s.market_id, si.external_id, m.platform, a.name
+           FROM asset_poll_state s
+           JOIN assets  a ON a.id = s.asset_id
+           JOIN markets m ON m.id = s.market_id
+           JOIN asset_source_ids si
+             ON si.asset_id = s.asset_id AND si.source = $1 AND si.game_id = a.game_id
+          WHERE a.game_id = $2 AND si.external_id = ANY($3)",
+    )
+    .bind(source)
+    .bind(game.0)
+    .bind(external_ids)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|(a, m, external_id, name)| DueAsset {
-            asset_id: AssetId(a),
-            market_id: MarketId(m),
-            external_id,
-            name,
+    rows.into_iter()
+        .map(|(asset_id, market_id, external_id, raw, name)| {
+            Ok(PollTarget {
+                asset_id: AssetId(asset_id),
+                market_id: MarketId(market_id),
+                external_id,
+                platform: platform(&raw)?,
+                name,
+            })
         })
-        .collect())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// The write path
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WriteCounts {
+    pub written: u64,
+    pub unchanged: u64,
 }
 
 /// The observation insert, the poll rows and the poll state update are one
 /// transaction. A kill between them would otherwise leave the coverage record
 /// claiming we read a price that was never stored.
-pub async fn write_batch(
+///
+/// `written` against `unchanged` is decided here rather than by the caller,
+/// because only the idempotency index knows whether the price actually moved.
+pub async fn write_polls(
     pool: &PgPool,
-    observations: &[Observation],
-    polls: &[(AssetId, MarketId, DateTime<Utc>, Option<DateTime<Utc>>, PollOutcome)],
+    polls: &[Poll],
+    polled_at: DateTime<Utc>,
     run_id: RunId,
-) -> Result<u64> {
+) -> Result<WriteCounts> {
     let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
-    let mut written = 0u64;
+    let mut counts = WriteCounts::default();
 
-    for o in observations {
-        let r = sqlx::query(
-            "INSERT INTO market_observations
-               (asset_id, market_id, source, observed_at, price,
-                min_price, max_price, source_ref, ingest_run_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(o.asset_id.0)
-        .bind(o.market_id.0)
-        .bind(o.source)
-        .bind(o.observed_at)
-        .bind(o.price)
-        .bind(o.min_price)
-        .bind(o.max_price)
-        .bind(o.source_ref.as_deref())
-        .bind(o.ingest_run_id.0)
-        .execute(&mut *tx)
-        .await?;
-        written += r.rows_affected();
-    }
+    for poll in polls {
+        let outcome = match &poll.result {
+            PollResult::Failed(outcome) => *outcome,
+            PollResult::Priced(observation) => {
+                if insert_observation(&mut tx, observation, run_id).await? {
+                    counts.written += 1;
+                    PollOutcome::Written
+                } else {
+                    // The insert conflicted, so this exact price at this exact
+                    // time is already recorded. The price did not move. That is
+                    // coverage evidence, not a write.
+                    counts.unchanged += 1;
+                    PollOutcome::Unchanged
+                }
+            }
+        };
 
-    for (asset_id, market_id, polled_at, source_observed_at, outcome) in polls {
         sqlx::query(
             "INSERT INTO ingest_polls
                (asset_id, market_id, polled_at, source_observed_at, outcome, run_id)
              VALUES ($1,$2,$3,$4,$5,$6)
              ON CONFLICT DO NOTHING",
         )
-        .bind(asset_id.0)
-        .bind(market_id.0)
+        .bind(poll.asset_id.0)
+        .bind(poll.market_id.0)
         .bind(polled_at)
-        .bind(*source_observed_at)
+        .bind(poll.source_observed_at)
         .bind(outcome.as_str())
         .bind(run_id.0)
         .execute(&mut *tx)
         .await?;
 
-        // A read that produced a price clears the failure count. A rejection
-        // increments it, which is what the valuation freshness gate reads.
+        // A read that produced a price clears the failure count, whether or not
+        // the price moved. Only a rejection increments it, and that count is what
+        // the valuation freshness gate reads.
         let failed = matches!(outcome, PollOutcome::Rejected | PollOutcome::NoPrice);
         sqlx::query(
             "UPDATE asset_poll_state
                 SET last_polled_at = $3,
-                    consecutive_failures = CASE WHEN $4 THEN consecutive_failures + 1 ELSE 0 END
+                    consecutive_failures =
+                        CASE WHEN $4 THEN consecutive_failures + 1 ELSE 0 END
               WHERE asset_id = $1 AND market_id = $2",
         )
-        .bind(asset_id.0)
-        .bind(market_id.0)
+        .bind(poll.asset_id.0)
+        .bind(poll.market_id.0)
         .bind(polled_at)
         .bind(failed)
         .execute(&mut *tx)
@@ -195,27 +362,386 @@ pub async fn write_batch(
     }
 
     tx.commit().await?;
-    Ok(written)
+    Ok(counts)
 }
+
+/// True when the row was stored, false when the idempotency index rejected it.
+async fn insert_observation(
+    tx: &mut Transaction<'_, Postgres>,
+    o: &Observation,
+    run_id: RunId,
+) -> Result<bool> {
+    let stored: Option<i32> = sqlx::query_scalar(
+        "INSERT INTO market_observations
+           (asset_id, market_id, source, observed_at, price,
+            min_price, max_price, source_ref, ingest_run_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT DO NOTHING
+         RETURNING 1",
+    )
+    .bind(o.asset_id.0)
+    .bind(o.market_id.0)
+    .bind(o.source)
+    .bind(o.observed_at)
+    .bind(o.price)
+    .bind(o.min_price)
+    .bind(o.max_price)
+    .bind(o.source_ref.as_deref())
+    .bind(run_id.0)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(stored.is_some())
+}
+
+// ---------------------------------------------------------------------------
+// Discovery and metadata
+// ---------------------------------------------------------------------------
+
+pub async fn known_external_ids(
+    pool: &PgPool,
+    source: &str,
+    game: GameId,
+) -> Result<HashSet<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT external_id FROM asset_source_ids WHERE source = $1 AND game_id = $2",
+    )
+    .bind(source)
+    .bind(game.0)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Creates the asset and its provider mapping.
+///
+/// The player row is a placeholder. Discovery knows a name and nothing else, and
+/// the real footballer is only identifiable once the metadata step supplies
+/// `ea_base_id`. `link_player` below repairs the link at that point.
+pub async fn insert_discovered_asset(
+    pool: &PgPool,
+    game: GameId,
+    source: &str,
+    external_id: &str,
+    name: &str,
+) -> Result<AssetId> {
+    let mut tx = pool.begin().await?;
+
+    let player = PlayerId::new();
+    sqlx::query("INSERT INTO players (id, name) VALUES ($1, $2)")
+        .bind(player.0)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+
+    let asset = AssetId::new();
+    sqlx::query("INSERT INTO assets (id, game_id, player_id, name) VALUES ($1,$2,$3,$4)")
+        .bind(asset.0)
+        .bind(game.0)
+        .bind(player.0)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO asset_source_ids (asset_id, game_id, source, external_id)
+         VALUES ($1,$2,$3,$4)",
+    )
+    .bind(asset.0)
+    .bind(game.0)
+    .bind(source)
+    .bind(external_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(asset)
+}
+
+/// How long ago a slow step last ran, taken from the run records.
+///
+/// A separate table would hold one row per step and would need its own migration
+/// for every new step. The run already records what it did.
+pub async fn seconds_since_step(pool: &PgPool, source: &str, step: &str) -> Result<Option<f64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM (now() - max(started_at)))::float8
+           FROM ingest_runs
+          WHERE source = $1
+            AND status <> 'failed'
+            AND (metadata->>$2)::boolean IS TRUE",
+    )
+    .bind(source)
+    .bind(step)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub struct CoveredAsset {
+    pub id: AssetId,
+    pub version: String,
+    pub rating: Option<i16>,
+}
+
+/// The assets worth spending the request budget on, most valuable first.
+///
+/// A promotional card outranks a base card whatever its rating, for the reason in
+/// section 4.2: pack supply accumulates for a base card and does not for a
+/// promotional one, so the two trade orders of magnitude apart.
+///
+/// `id` breaks the final tie so that two runs over unchanged data pick the same
+/// set. Without it the covered set would churn and assets would silently enter
+/// and leave the rotation.
+pub async fn most_valuable_assets(
+    pool: &PgPool,
+    game: GameId,
+    limit: i64,
+) -> Result<Vec<CoveredAsset>> {
+    let rows: Vec<(Uuid, String, Option<i16>)> = sqlx::query_as(
+        "SELECT id, version, rating
+           FROM assets
+          WHERE game_id = $1
+          ORDER BY (version <> 'base') DESC, rating DESC NULLS LAST, id
+          LIMIT $2",
+    )
+    .bind(game.0)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, version, rating)| CoveredAsset {
+            id: AssetId(id),
+            version,
+            rating,
+        })
+        .collect())
+}
+
+/// Stops polling the assets that fell out of the covered set.
+///
+/// Only the schedule goes. The observations and the coverage record stay, because
+/// the ledger is the asset, and the quota frees immediately.
+pub async fn drop_poll_state_outside(
+    pool: &PgPool,
+    game: GameId,
+    covered: &[Uuid],
+) -> Result<u64> {
+    let r = sqlx::query(
+        "DELETE FROM asset_poll_state s
+          USING assets a
+          WHERE a.id = s.asset_id
+            AND a.game_id = $1
+            AND NOT (s.asset_id = ANY($2))",
+    )
+    .bind(game.0)
+    .bind(covered)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
+/// Section 4.7: discovery is the only thing that creates poll state rows.
+pub async fn ensure_poll_state(
+    pool: &PgPool,
+    asset: AssetId,
+    market: MarketId,
+    interval_seconds: i32,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO asset_poll_state (asset_id, market_id, poll_interval_seconds)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (asset_id, market_id) DO NOTHING",
+    )
+    .bind(asset.0)
+    .bind(market.0)
+    .bind(interval_seconds)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Assets that have never had attributes, and assets whose attributes are older
+/// than the metadata cadence.
+///
+/// Without this the valuation columns stay null and the terminal has nothing to
+/// compute, whatever the price history holds.
+pub async fn assets_needing_metadata(
+    pool: &PgPool,
+    source: &str,
+    game: GameId,
+    cadence_seconds: i64,
+    limit: i64,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT si.external_id
+           FROM assets a
+           JOIN asset_source_ids si
+             ON si.asset_id = a.id AND si.source = $1 AND si.game_id = a.game_id
+          WHERE a.game_id = $2
+            AND (a.last_seen_at IS NULL
+                 OR a.last_seen_at < now() - make_interval(secs => $3))
+          ORDER BY a.last_seen_at NULLS FIRST
+          LIMIT $4",
+    )
+    .bind(source)
+    .bind(game.0)
+    .bind(cadence_seconds as f64)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn asset_by_external_id(
+    pool: &PgPool,
+    source: &str,
+    game: GameId,
+    external_id: &str,
+) -> Result<Option<AssetId>> {
+    let id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT asset_id FROM asset_source_ids
+          WHERE source = $1 AND game_id = $2 AND external_id = $3",
+    )
+    .bind(source)
+    .bind(game.0)
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id.map(AssetId))
+}
+
+/// Writes the canonical attributes and re-tiers the asset.
+///
+/// The poll interval is recomputed here because the tier expression reads
+/// `version` and `rating`, and both arrive with the metadata. Discovery creates
+/// the row; this keeps its interval honest afterwards.
+pub async fn update_asset_attributes(
+    pool: &PgPool,
+    asset: AssetId,
+    attrs: &AssetAttributes,
+    interval_seconds: i32,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        "UPDATE assets
+            SET name = $2, rating = $3, rarity = $4, version = $5, position = $6,
+                league_id = $7, nation_id = $8, club_id = $9,
+                skill_moves = $10, weak_foot = $11, pace = $12, shooting = $13,
+                passing = $14, dribbling = $15, defending = $16, physicality = $17,
+                playstyle_count = $18, last_seen_at = now()
+          WHERE id = $1",
+    )
+    .bind(asset.0)
+    .bind(&attrs.name)
+    .bind(attrs.rating)
+    .bind(attrs.rarity.as_str())
+    .bind(&attrs.version)
+    .bind(attrs.position.as_deref())
+    .bind(attrs.league_id)
+    .bind(attrs.nation_id)
+    .bind(attrs.club_id)
+    .bind(attrs.skill_moves)
+    .bind(attrs.weak_foot)
+    .bind(attrs.pace)
+    .bind(attrs.shooting)
+    .bind(attrs.passing)
+    .bind(attrs.dribbling)
+    .bind(attrs.defending)
+    .bind(attrs.physicality)
+    .bind(attrs.playstyle_count)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE asset_poll_state SET poll_interval_seconds = $2 WHERE asset_id = $1",
+    )
+    .bind(asset.0)
+    .bind(interval_seconds)
+    .execute(&mut *tx)
+    .await?;
+
+    if let Some(ea_base_id) = attrs.ea_base_id {
+        link_player(&mut tx, asset, &attrs.name, ea_base_id).await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Points the asset at the real footballer.
+///
+/// Discovery gives every asset its own placeholder player, so a base card and a
+/// promotional card of one footballer start apart. `ea_base_id` is the first
+/// thing that can join them, and it only arrives with the metadata.
+async fn link_player(
+    tx: &mut Transaction<'_, Postgres>,
+    asset: AssetId,
+    name: &str,
+    ea_base_id: i64,
+) -> Result<()> {
+    let player: Uuid = sqlx::query_scalar(
+        "INSERT INTO players (id, name, ea_base_id) VALUES ($1,$2,$3)
+         ON CONFLICT (ea_base_id) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .bind(PlayerId::new().0)
+    .bind(name)
+    .bind(ea_base_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let previous: Uuid = sqlx::query_scalar("SELECT player_id FROM assets WHERE id = $1")
+        .bind(asset.0)
+        .fetch_one(&mut **tx)
+        .await?;
+
+    sqlx::query("UPDATE assets SET player_id = $2 WHERE id = $1")
+        .bind(asset.0)
+        .bind(player)
+        .execute(&mut **tx)
+        .await?;
+
+    // The placeholder is rubbish once nothing points at it, and leaving it would
+    // make the player table a count of cards rather than of footballers.
+    if previous != player {
+        sqlx::query(
+            "DELETE FROM players p
+              WHERE p.id = $1 AND p.ea_base_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.player_id = p.id)",
+        )
+        .bind(previous)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
 
 /// Health reads the poll table, never the observation table. The observation
 /// table records changes only, so a quiet market writes nothing and would look
 /// exactly like an outage.
 pub async fn newest_poll_age_seconds(pool: &PgPool) -> Result<Option<f64>> {
     Ok(
-        sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM (now() - max(polled_at))) FROM ingest_polls")
+        sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM (now() - max(polled_at)))::float8 FROM ingest_polls")
             .fetch_one(pool)
             .await?,
     )
 }
 
 pub async fn largest_poll_interval_seconds(pool: &PgPool) -> Result<i32> {
-    Ok(
-        sqlx::query_scalar("SELECT COALESCE(max(poll_interval_seconds), 14400) FROM asset_poll_state")
-            .fetch_one(pool)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(max(poll_interval_seconds), 14400) FROM asset_poll_state",
     )
+    .fetch_one(pool)
+    .await?)
 }
+
+// ---------------------------------------------------------------------------
+// Replay
+// ---------------------------------------------------------------------------
 
 /// Replay is the one deliberate exception to the append-only rule. Without it a
 /// parser bug would be permanent, because ON CONFLICT DO NOTHING keeps whatever
@@ -226,4 +752,85 @@ pub async fn delete_run_observations(pool: &PgPool, run_id: RunId) -> Result<u64
         .execute(pool)
         .await?;
     Ok(r.rows_affected())
+}
+
+/// Identity resolution on its own, with no reference to the schedule.
+///
+/// Section 4.4: one indexed lookup of `(game_id, source, external_id)` returns the
+/// asset, and there is no fuzzy match. Replay uses this rather than
+/// `poll_targets_for`, because an asset that has left the covered set still has a
+/// history and that history must still be correctable.
+pub async fn resolve_targets(
+    pool: &PgPool,
+    source: &str,
+    game: GameId,
+    external_ids: &[String],
+) -> Result<Vec<PollTarget>> {
+    let rows: Vec<(Uuid, Uuid, String, String, String)> = sqlx::query_as(
+        "SELECT si.asset_id, m.id, si.external_id, m.platform, a.name
+           FROM asset_source_ids si
+           JOIN assets  a ON a.id = si.asset_id
+           JOIN markets m ON m.game_id = si.game_id
+          WHERE si.source = $1 AND si.game_id = $2 AND si.external_id = ANY($3)",
+    )
+    .bind(source)
+    .bind(game.0)
+    .bind(external_ids)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(asset_id, market_id, external_id, raw, name)| {
+            Ok(PollTarget {
+                asset_id: AssetId(asset_id),
+                market_id: MarketId(market_id),
+                external_id,
+                platform: platform(&raw)?,
+                name,
+            })
+        })
+        .collect()
+}
+
+/// Observations without poll rows. Replay uses this: a replay re-reads an
+/// archive, it is not evidence that we looked at the market, so it must not
+/// manufacture coverage.
+pub async fn insert_observations(
+    pool: &PgPool,
+    observations: &[Observation],
+    run_id: RunId,
+) -> Result<u64> {
+    let mut tx = pool.begin().await?;
+    let mut written = 0;
+    for o in observations {
+        if insert_observation(&mut tx, o, run_id).await? {
+            written += 1;
+        }
+    }
+    tx.commit().await?;
+    Ok(written)
+}
+
+/// The archive keys one run wrote, in the order it wrote them. Replay re-reads
+/// exactly these.
+pub async fn run_archive_keys(pool: &PgPool, run_id: RunId) -> Result<Vec<String>> {
+    let keys: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata->'price_keys' FROM ingest_runs WHERE id = $1")
+            .bind(run_id.0)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+
+    Ok(keys
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+        .unwrap_or_default())
+}
+
+pub async fn run_started_at(pool: &PgPool, run_id: RunId) -> Result<Option<DateTime<Utc>>> {
+    Ok(
+        sqlx::query_scalar("SELECT started_at FROM ingest_runs WHERE id = $1")
+            .bind(run_id.0)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
