@@ -17,14 +17,27 @@ first. It holds the schema, the ingestion rules and the accepted risks.
 
 Rust 1.90 or later, Node with pnpm, and Docker.
 
+The whole stack, the way it runs in production:
+
 ```sh
-docker compose up -d          # TimescaleDB on 5434, MinIO on 9002
+docker compose up -d --build   # TimescaleDB, MinIO, and the server
+curl localhost:8090/health
+
+cd apps/web && pnpm install && pnpm dev
+```
+
+The server container migrates and then serves, so it can never start against a
+schema that has not been brought forward. Every service sets
+`restart: unless-stopped`, because a host reboot must not end the ledger.
+
+To work on the server itself, run it on the host against the same containers:
+
+```sh
+docker compose up -d db objectstore
 cp .env.example .env
 cargo run -- migrate          # schema, then the game and its two markets
 cargo run -- ingest           # one pass: discover, learn, cover, price
 cargo run -- serve            # API on 8090, plus ingestion on an interval
-
-cd apps/web && pnpm install && pnpm dev
 ```
 
 Ports avoid the usual local collisions: 5434 for PostgreSQL, 9002 and 9003 for
@@ -47,10 +60,38 @@ automatically.
 
 ## Operating notes
 
-**`PG_DUMP_PATH` must match the server's major version.** The database image
-ships a matching `pg_dump`; a host binary often does not. A restore calls
-`timescaledb_pre_restore()` before the load and `timescaledb_post_restore()`
-after it.
+**The API has no authentication.** Every endpoint is readable by anyone who can
+reach the port. `docker-compose.yml` therefore publishes the API, the database
+and the object store on loopback only. Put something that authenticates in front
+of the API before it faces a network, and do not remove the `127.0.0.1` prefixes
+without doing so.
+
+**The object store credentials are required, not defaulted.** A deployment that
+misses one fails at start rather than quietly authenticating with the
+development values in `.env.example`.
+
+**`PG_DUMP_PATH` must be at least as new as the server.** The database image
+ships a matching `pg_dump`; a host binary is often a different version. Newer is
+fine, older is not.
+
+**Restoring is `scripts/restore.sh <dump-file> [target-database]`.** Do not do it
+by hand. `timescaledb_pre_restore()` must run before `pg_restore` and
+`timescaledb_post_restore()` after it, and skipping the first fails part way
+through with a misleading message:
+
+```
+ERROR: table "market_observations" is not a hypertable
+```
+
+by which point the database holds a partial restore.
+
+The restore path is verified, not assumed. A dump taken by the `backup` command
+and pulled back out of the bucket restores with identical row counts, keeps its
+hypertables, its compression settings, its already compressed chunks and its
+compression policies, and still rejects a duplicate while accepting a
+restatement. Pointing the server at the restored copy and running one ingest
+reports every known price as `unchanged`, which is what proves identity
+resolution and the idempotency index both survived.
 
 **Set the dead man's switch grace period above the largest poll interval**, which
 is four hours by default. A run that closes `degraded` or `failed` sends no

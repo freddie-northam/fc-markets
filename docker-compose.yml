@@ -9,7 +9,9 @@ services:
       POSTGRES_PASSWORD: fcmarket
       POSTGRES_DB: fcmarket
     ports:
-      - "5434:5432"
+      # Loopback only. Compose publishes to 0.0.0.0 by default, and these
+      # credentials are in the repository.
+      - "127.0.0.1:5434:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
     healthcheck:
@@ -28,8 +30,8 @@ services:
       MINIO_ROOT_USER: fcmarket
       MINIO_ROOT_PASSWORD: fcmarketsecret
     ports:
-      - "9002:9000"
-      - "9003:9001"
+      - "127.0.0.1:9002:9000"
+      - "127.0.0.1:9003:9001"
     volumes:
       - objectstore-data:/data
     healthcheck:
@@ -37,6 +39,53 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+
+  # The ledger writer. Section 4.9: a host reboot must not end the ledger, so
+  # this is a service under a restart policy rather than a process somebody left
+  # running in a terminal.
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      objectstore:
+        condition: service_healthy
+    environment:
+      # Inside the network the database listens on its own port, not the one
+      # remapped for the host.
+      DATABASE_URL: postgres://fcmarket:fcmarket@db:5432/fcmarket
+      OBJECT_STORE_ENDPOINT: http://objectstore:9000
+      OBJECT_STORE_BUCKET: fc-market-raw
+      OBJECT_STORE_ACCESS_KEY: fcmarket
+      OBJECT_STORE_SECRET_KEY: fcmarketsecret
+      BIND_ADDRESS: 0.0.0.0:8090
+      FIXTURE_DIR: /app/fixtures/fixture
+      # The image ships a pg_dump newer than the server, which is the direction
+      # that works.
+      PG_DUMP_PATH: pg_dump
+      # The disk that matters is the one PostgreSQL writes to, not this
+      # container's own filesystem. Mounted read only below.
+      DISK_CHECK_PATH: /var/lib/postgresql/data
+      MIN_FREE_DISK_BYTES: 5368709120
+      INGEST_INTERVAL_SECONDS: 900
+      RUST_LOG: info
+    volumes:
+      # Read only, and only so the health check can measure free space on the
+      # volume that compression needs room on.
+      - db-data:/var/lib/postgresql/data:ro
+    ports:
+      # The API has no authentication. It must sit behind something that
+      # does before it faces a network.
+      - "127.0.0.1:8090:8090"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   db-data:

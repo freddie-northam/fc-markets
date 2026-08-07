@@ -67,7 +67,7 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
         }
     }
 
-    if let Some(free) = free_disk_bytes(".")
+    if let Some(free) = free_disk_bytes(&s.config.disk_check_path)
         && free < s.config.min_free_disk_bytes
     {
         // Compression needs room for a compressed copy before it drops the

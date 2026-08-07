@@ -189,6 +189,7 @@ pub fn test_config() -> Config {
         daily_request_budget: 1_000,
         http_timeout: std::time::Duration::from_secs(5),
         min_free_disk_bytes: 0,
+        disk_check_path: ".".into(),
         heartbeat_url: None,
         api_row_cap: 5_000,
         bind_address: "127.0.0.1:0".into(),
