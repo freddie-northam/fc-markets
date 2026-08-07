@@ -5,11 +5,77 @@ A quantitative market terminal sits on top of that ledger.
 
 ## Status
 
-This project is at the foundation stage. The design exists. Adversarial review is
-in progress. No code exists yet.
+The foundation is built and runs end to end. The ledger cannot start, because no
+data source is available yet. A `fixture` source stands in: it serves saved
+payloads from disk, so every link of the pipeline is genuine except the network
+call.
 
 Read the [design document](docs/superpowers/specs/2026-08-07-fc-market-foundation-design.md)
 first. It holds the schema, the ingestion rules and the accepted risks.
+
+## Run it
+
+Rust 1.90 or later, Node with pnpm, and Docker.
+
+```sh
+docker compose up -d          # TimescaleDB on 5434, MinIO on 9002
+cp .env.example .env
+cargo run -- migrate          # schema, then the game and its two markets
+cargo run -- ingest           # one pass: discover, learn, cover, price
+cargo run -- serve            # API on 8090, plus ingestion on an interval
+
+cd apps/web && pnpm install && pnpm dev
+```
+
+Ports avoid the usual local collisions: 5434 for PostgreSQL, 9002 and 9003 for
+the object store, 8090 for the API.
+
+`cargo test` needs the database running. Each test builds and drops its own.
+
+### Commands
+
+| Command | Purpose |
+|---|---|
+| `migrate` | Apply pending migrations and stop |
+| `ingest` | One ingestion pass and stop |
+| `serve` | The API, the interval ingest and the nightly dump |
+| `backup` | One `pg_dump -Fc` to the archive bucket |
+| `replay <run-id>` | Re-parse one run's archived payloads under the current parser |
+
+`replay` is the one deliberate exception to the append-only rule. It never runs
+automatically.
+
+## Operating notes
+
+**`PG_DUMP_PATH` must match the server's major version.** The database image
+ships a matching `pg_dump`; a host binary often does not. A restore calls
+`timescaledb_pre_restore()` before the load and `timescaledb_post_restore()`
+after it.
+
+**Set the dead man's switch grace period above the largest poll interval**, which
+is four hours by default. A run that closes `degraded` or `failed` sends no
+heartbeat on purpose, so the drift checks raise their alarm through the same
+channel as a dead host.
+
+**The drift thresholds are guesses.** No source exists, so nothing has been
+checked against real data. The same applies to the class size of five in the
+valuation and to the tier sizes. Check all three before fixing them.
+
+**The fixture ages.** Its saved timestamps are fixed, so after a day the frozen
+feed check correctly reports it as stale. That is the check working, not a fault.
+
+## Not built
+
+Named in the design but deliberately absent:
+
+- **`backfill`**. Section 4.1 lists the command, and no other section defines what
+  it should do. It waits for a definition rather than a guess.
+- **An HTTP source.** `SOURCE_API_KEY` and `HTTP_TIMEOUT_SECONDS` are read into
+  the config and nothing consumes them yet. They stay because section 4.5
+  requires the source client to set an explicit request timeout, and a provider
+  added without one would retry silently and spend the quota twice.
+- The event model, indices, signals, delivery, predictions and accounts, which
+  section 8 puts outside this milestone.
 
 ## Purpose
 

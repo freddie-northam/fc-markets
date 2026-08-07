@@ -201,7 +201,11 @@ pub async fn requests_spent_today(pool: &PgPool, source: &str) -> Result<i64> {
     Ok(sqlx::query_scalar(
         "SELECT COALESCE(sum((metadata->>'requests')::bigint), 0)::bigint
            FROM ingest_runs
-          WHERE source = $1 AND started_at >= date_trunc('day', now())",
+          -- The day is a UTC day, stated explicitly. date_trunc on a bare now()
+          -- truncates in the session TimeZone, so the budget window would move
+          -- with the server's configuration rather than staying put.
+          WHERE source = $1
+            AND started_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
     )
     .bind(source)
     .fetch_one(pool)
@@ -238,6 +242,14 @@ pub struct PollTarget {
     pub name: String,
 }
 
+/// How far a failing asset's interval may stretch.
+///
+/// Section 4.5 has no retry policy: the next scheduled poll is the retry, and
+/// `consecutive_failures` supplies the backoff. Without a cap a card that failed
+/// for a week would stop being tried at all; without the backoff a permanently
+/// broken card would spend full rate quota for ever and crowd out healthy ones.
+const MAX_FAILURE_BACKOFF: i32 = 8;
+
 /// The identifiers that are due, not the (asset, market) pairs.
 ///
 /// A request returns every platform at once, so the budget is spent per
@@ -255,14 +267,21 @@ pub async fn due_external_ids(
            JOIN asset_source_ids si
              ON si.asset_id = s.asset_id AND si.source = $1 AND si.game_id = a.game_id
           WHERE a.game_id = $2
+            -- consecutive_failures stretches the interval. A card we cannot read
+            -- is retried more slowly each time rather than spending full rate
+            -- quota that a healthy card could use.
             AND (s.last_polled_at IS NULL
-                 OR s.last_polled_at + make_interval(secs => s.poll_interval_seconds) <= now())
+                 OR s.last_polled_at
+                    + make_interval(secs => s.poll_interval_seconds
+                                            * LEAST(s.consecutive_failures + 1, $4))
+                    <= now())
           ORDER BY si.external_id, s.last_polled_at NULLS FIRST
           LIMIT $3",
     )
     .bind(source)
     .bind(game.0)
     .bind(limit)
+    .bind(MAX_FAILURE_BACKOFF)
     .fetch_all(pool)
     .await?)
 }
@@ -548,23 +567,29 @@ pub async fn drop_poll_state_outside(pool: &PgPool, game: GameId, covered: &[Uui
 }
 
 /// Section 4.7: discovery is the only thing that creates poll state rows.
-pub async fn ensure_poll_state(
-    pool: &PgPool,
-    asset: AssetId,
-    market: MarketId,
-    interval_seconds: i32,
-) -> Result<()> {
-    sqlx::query(
+///
+/// One statement for the whole covered set. Coverage is reasserted on every run,
+/// so a query per asset and market would be twelve hundred round trips every
+/// fifteen minutes to restate rows that almost never change.
+pub async fn ensure_poll_state(pool: &PgPool, rows: &[(AssetId, MarketId, i32)]) -> Result<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let assets: Vec<Uuid> = rows.iter().map(|(a, _, _)| a.0).collect();
+    let markets: Vec<Uuid> = rows.iter().map(|(_, m, _)| m.0).collect();
+    let intervals: Vec<i32> = rows.iter().map(|(_, _, i)| *i).collect();
+
+    let result = sqlx::query(
         "INSERT INTO asset_poll_state (asset_id, market_id, poll_interval_seconds)
-         VALUES ($1,$2,$3)
+         SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::int[])
          ON CONFLICT (asset_id, market_id) DO NOTHING",
     )
-    .bind(asset.0)
-    .bind(market.0)
-    .bind(interval_seconds)
+    .bind(&assets)
+    .bind(&markets)
+    .bind(&intervals)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected())
 }
 
 /// Assets that have never had attributes, and assets whose attributes are older

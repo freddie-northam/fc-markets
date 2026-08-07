@@ -941,3 +941,109 @@ async fn a_replay_that_cannot_read_its_archive_leaves_the_ledger_untouched() {
     );
     db.cleanup().await;
 }
+
+/// Section 4.5 has no retry policy: the next scheduled poll is the retry, and
+/// `consecutive_failures` supplies the backoff. Without it a permanently broken
+/// card spends full rate quota for ever and crowds out the healthy ones.
+#[tokio::test]
+async fn a_failing_asset_backs_off_while_a_healthy_one_stays_on_its_interval() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![
+        Card::new("101", "Healthy").recent(9_000, 3),
+        Card::new("102", "Broken")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
+    ]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    // Both were polled just now. Wind the clock back by one interval: the healthy
+    // card is due again, the failing one is not, because its interval doubled.
+    sqlx::query(
+        "UPDATE asset_poll_state
+            SET last_polled_at = now() - make_interval(secs => poll_interval_seconds + 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let game = db.game().await.unwrap();
+    let due = db::due_external_ids(&db.pool, "test", game.id, 100)
+        .await
+        .unwrap();
+
+    assert!(due.contains(&"101".to_string()), "the healthy card is due");
+    assert!(
+        !due.contains(&"102".to_string()),
+        "the failing card must wait longer than its base interval"
+    );
+
+    // Far enough back and even a failing card is retried. A backoff that never
+    // ends is an asset silently dropped from coverage.
+    sqlx::query(
+        "UPDATE asset_poll_state
+            SET last_polled_at = now() - make_interval(secs => poll_interval_seconds * 20)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let due = db::due_external_ids(&db.pool, "test", game.id, 100)
+        .await
+        .unwrap();
+    assert!(
+        due.contains(&"102".to_string()),
+        "the retry must come round"
+    );
+
+    db.cleanup().await;
+}
+
+/// Compression is applied to chunks older than 30 days, and the ledger is kept
+/// for ever, so almost every row will live in a compressed chunk. A restatement
+/// or a replay that could not touch one would mean the archive stops being able
+/// to correct the ledger after a month.
+#[tokio::test]
+async fn a_compressed_chunk_still_accepts_a_restatement_and_a_replay() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 6)]);
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+    let RunOutcome::Completed { run_id, .. } = outcome else {
+        panic!("the run must complete")
+    };
+
+    let compressed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT compress_chunk(c) FROM show_chunks('market_observations') c) s",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the chunk must compress");
+    assert!(compressed > 0);
+
+    // A genuine restatement: the same instant, a corrected price.
+    source.set_cards(vec![Card::new("101", "Marco Verratti").recent(9_000, 6)]);
+    let corrected = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_400, 6)]);
+    make_everything_due(&db.pool).await.unwrap();
+    run_once(&db, &corrected, &archive).await.unwrap();
+
+    assert!(
+        db.count("SELECT count(*) FROM market_observations").await > 2,
+        "a corrected price must still land in a compressed chunk"
+    );
+
+    // And replay must still be able to delete out of one.
+    let config = db.config();
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &archive,
+        source: &source,
+        config: &config,
+    };
+    let report = ingest::replay(&runner, run_id).await.unwrap();
+    assert!(
+        report.deleted > 0,
+        "replay must be able to remove rows from a compressed chunk"
+    );
+
+    db.cleanup().await;
+}
