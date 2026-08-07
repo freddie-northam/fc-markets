@@ -61,6 +61,7 @@ impl TestDb {
         let name = format!("fcm_test_{}", Uuid::now_v7().simple());
 
         let admin = sqlx::PgPool::connect(&admin_url).await?;
+        sweep_stale_databases(&admin).await;
         admin
             .execute(format!(r#"CREATE DATABASE "{name}""#).as_str())
             .await?;
@@ -126,6 +127,45 @@ impl TestDb {
             .await
             .expect("count query")
     }
+}
+
+/// A test database is stale once no live run could still own it. A whole suite
+/// runs in seconds, so half an hour is far beyond any run in flight.
+const STALE_AFTER_MS: u64 = 30 * 60 * 1000;
+
+/// Drops test databases left behind by earlier runs.
+///
+/// `cleanup` runs at the end of a test, so a test that PANICS never reaches it
+/// and leaks its database. That is the normal state of a suite under
+/// development, and without this sweep a working day leaves dozens behind.
+///
+/// Age comes from the name, which carries a version 7 uuid whose first 48 bits
+/// are the creation time in milliseconds. Dropping by age rather than by "has no
+/// connections" is what makes this safe to run while other tests are in flight.
+async fn sweep_stale_databases(admin: &PgPool) {
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT datname FROM pg_database WHERE datname ~ '^fcm_test_'")
+            .fetch_all(admin)
+            .await
+            .unwrap_or_default();
+
+    let now = Utc::now().timestamp_millis().max(0) as u64;
+    for name in names {
+        let Some(created) = created_ms(&name) else {
+            continue;
+        };
+        if now.saturating_sub(created) < STALE_AFTER_MS {
+            continue;
+        }
+        let _ = admin
+            .execute(format!(r#"DROP DATABASE IF EXISTS "{name}" WITH (FORCE)"#).as_str())
+            .await;
+    }
+}
+
+fn created_ms(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("fcm_test_")?;
+    u64::from_str_radix(hex.get(..12)?, 16).ok()
 }
 
 fn replace_database(url: &str, name: &str) -> String {
@@ -679,4 +719,30 @@ pub async fn seed_poll(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod harness_tests {
+    use super::*;
+
+    /// The sweep drops databases by age, so a wrong reading of the name would
+    /// either drop a live test's database or never reclaim anything.
+    #[test]
+    fn the_creation_time_is_read_back_out_of_the_name() {
+        let before = Utc::now().timestamp_millis() as u64;
+        let name = format!("fcm_test_{}", Uuid::now_v7().simple());
+        let after = Utc::now().timestamp_millis() as u64;
+
+        let created = created_ms(&name).expect("the name carries a version 7 uuid");
+        assert!(
+            created >= before.saturating_sub(1) && created <= after + 1,
+            "read {created}, expected between {before} and {after}"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_ours_is_left_alone() {
+        assert_eq!(created_ms("fcmarket"), None);
+        assert_eq!(created_ms("fcm_test_short"), None);
+    }
 }
