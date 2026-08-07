@@ -35,7 +35,6 @@ pub enum RunOutcome {
     Completed {
         run_id: RunId,
         status: RunStatus,
-        counts: db::RunCounts,
     },
 }
 
@@ -174,24 +173,20 @@ async fn run_locked(runner: &Runner<'_>) -> Result<RunOutcome> {
         tally.status()
     };
 
-    let mut metadata = serde_json::json!({
-        "requests": tally.requests,
-        "price_keys": tally.price_keys,
-        "unchanged": tally.unchanged,
-        "no_price": tally.no_price,
-        "degraded_reasons": tally.degraded,
-    });
-    for step in &tally.steps {
-        metadata[*step] = serde_json::Value::Bool(true);
-    }
-
+    // `requests`, `price_keys` and the step flags are deliberately absent here.
+    // They are written as they happen, so a run that never reaches this point
+    // still leaves them behind. What remains is closing summary only.
     db::close_run(
         runner.pool,
         run_id,
         status,
         tally.counts(),
         error.as_deref(),
-        metadata,
+        serde_json::json!({
+            "unchanged": tally.unchanged,
+            "no_price": tally.no_price,
+            "degraded_reasons": tally.degraded,
+        }),
     )
     .await?;
 
@@ -203,11 +198,7 @@ async fn run_locked(runner: &Runner<'_>) -> Result<RunOutcome> {
         "run closed"
     );
 
-    Ok(RunOutcome::Completed {
-        run_id,
-        status,
-        counts: tally.counts(),
-    })
+    Ok(RunOutcome::Completed { run_id, status })
 }
 
 /// The body of a run, separated so that `run` always closes the record.
@@ -266,6 +257,7 @@ async fn ingest_prices(
         }
         db::touch_heartbeat(runner.pool, run_id).await?;
         tally.requests += 1;
+        db::record_request(runner.pool, run_id).await?;
 
         let envelope = match runner.source.fetch_prices(chunk).await {
             Ok(envelope) => envelope,
@@ -298,6 +290,10 @@ async fn ingest_prices(
             ));
             continue;
         }
+        // Recorded now, not at close. A run killed after this point still has a
+        // replayable archive; recorded only at close, its stored payloads would
+        // be unreachable.
+        db::record_price_key(runner.pool, run_id, &key).await?;
         tally.price_keys.push(key);
 
         if let Err(e) =
@@ -438,9 +434,21 @@ pub async fn replay(runner: &Runner<'_>, original: RunId) -> Result<ReplayReport
 }
 
 async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayReport> {
-    let (started_at, keys) = db::run_replay_source(runner.pool, original)
+    let recorded = db::run_replay_source(runner.pool, original)
         .await?
         .with_context(|| format!("no run {original}"))?;
+
+    // Re-parsing one provider's payloads with another's parser would rewrite that
+    // run's history under a parser that never saw the shape, and the result would
+    // look like a successful replay.
+    if recorded.source != runner.source.name() {
+        anyhow::bail!(
+            "run {original} was written by source {}, not {}",
+            recorded.source,
+            runner.source.name()
+        );
+    }
+    let (started_at, keys) = (recorded.started_at, recorded.keys);
     if keys.is_empty() {
         anyhow::bail!("run {original} archived no price payloads, so there is nothing to replay");
     }
@@ -453,11 +461,39 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
     )
     .await?;
 
+    // Everything past this point must close the row it just opened. Leaving it
+    // `running` puts a phantom in the open-run count until some later ingest
+    // reaps it an hour on, and each retry of a failing replay adds another.
+    match replay_batches(runner, &game, original, replacement, started_at, &keys).await {
+        Ok(report) => Ok(report),
+        Err(e) => {
+            db::close_run(
+                runner.pool,
+                replacement,
+                RunStatus::Failed,
+                db::RunCounts::default(),
+                Some(&e.to_string()),
+                serde_json::json!({ "replay_of": original.to_string() }),
+            )
+            .await?;
+            Err(e)
+        }
+    }
+}
+
+async fn replay_batches(
+    runner: &Runner<'_>,
+    game: &db::Game,
+    original: RunId,
+    replacement: RunId,
+    started_at: DateTime<Utc>,
+    keys: &[String],
+) -> Result<ReplayReport> {
     // Everything is read and parsed BEFORE anything is deleted. A failed archive
     // read must leave the ledger exactly as it was.
     let mut replacements = Vec::new();
     let mut tally = Tally::default();
-    for key in &keys {
+    for key in keys {
         let envelope = runner.archive.get(key).await?;
         let quotes = runner.source.parse_prices(&envelope)?;
 
@@ -480,7 +516,7 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
                 continue;
             };
             tally.seen += 1;
-            match validate(&game, target, quote, started_at) {
+            match validate(game, target, quote, started_at) {
                 Err(why) => {
                     tally.rejected += 1;
                     log_rejection(&mut tally, &target.external_id, why);
@@ -511,7 +547,7 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
         None,
         serde_json::json!({
             "replay_of": original.to_string(),
-            "price_keys": keys,
+            "price_keys": keys.to_vec(),
             "requests": 0,
         }),
     )

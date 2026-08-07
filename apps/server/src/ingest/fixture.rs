@@ -10,7 +10,7 @@
 //! on a provider we intend to be able to replace.
 
 use crate::archive::Envelope;
-use crate::domain::{AssetAttributes, Rarity};
+use crate::domain::{AssetAttributes, Rarity, canonical_version};
 use crate::ids::Platform;
 use crate::source::{FetchError, FetchResult, Listing, ParsedQuote, Source};
 use anyhow::{Context, Result};
@@ -240,7 +240,7 @@ impl Source for FixtureSource {
                     Some("common") => Rarity::Common,
                     _ => Rarity::Rare,
                 },
-                version: r.version.unwrap_or_else(|| "base".to_string()),
+                version: canonical_version(r.version),
                 position: r.position,
                 league_id: r.league,
                 nation_id: r.nation,

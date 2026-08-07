@@ -50,7 +50,12 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
     let mut reasons = Vec::new();
 
     match db::newest_poll_age_seconds(&s.pool).await {
-        Err(e) => reasons.push(format!("cannot read poll history: {e}")),
+        Err(e) => {
+            // The detail goes to the operator, not into an unauthenticated body.
+            // ApiError already draws that line; this path was crossing it.
+            tracing::error!(error = %e, "cannot read the poll history");
+            reasons.push("the poll history cannot be read".to_string());
+        }
         Ok(None) => {} // Nothing polled yet. A fresh install is not a fault.
         Ok(Some(age)) => {
             let limit = db::largest_poll_interval_seconds(&s.pool)
@@ -177,16 +182,24 @@ async fn asset_prices(
     let from = range.from.unwrap_or(to - chrono::Duration::days(30));
 
     let rows = sqlx::query_as::<_, PricePoint>(
-        "SELECT observed_at, price, source, market_id
-           FROM market_observations
-          WHERE asset_id = $1
-            AND observed_at >= $2 AND observed_at <= $3
-            AND ($5::uuid IS NULL OR market_id = $5)
-          -- market_id and source break the tie. Without them two markets, or two
-          -- sources at one instant, come back in an arbitrary order and the same
-          -- request answers differently on different days.
-          ORDER BY observed_at, market_id, source
-          LIMIT $4",
+        // The cap takes from the NEWEST end and the result is then re-sorted
+        // ascending. Capping an ascending scan keeps the oldest rows, so a range
+        // wider than the cap silently dropped the most recent prices, and the
+        // caller's "latest" became the price at the cap boundary.
+        //
+        // market_id and source break the tie. Without them two markets, or two
+        // sources at one instant, come back in an arbitrary order and the same
+        // request answers differently on different days.
+        "SELECT * FROM (
+            SELECT observed_at, price, source, market_id
+              FROM market_observations
+             WHERE asset_id = $1
+               AND observed_at >= $2 AND observed_at <= $3
+               AND ($5::uuid IS NULL OR market_id = $5)
+             ORDER BY observed_at DESC, market_id DESC, source DESC
+             LIMIT $4
+         ) recent
+         ORDER BY observed_at, market_id, source",
     )
     .bind(id)
     .bind(from)

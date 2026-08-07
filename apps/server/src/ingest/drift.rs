@@ -95,9 +95,15 @@ pub async fn checks(
 /// aggregate: across every covered asset, nothing at all has moved for a day.
 async fn frozen_feed(pool: &PgPool) -> Result<Option<String>> {
     let newest: Option<f64> = sqlx::query_scalar(
+        // Bounded on polled_at, the partitioning column, so TimescaleDB excludes
+        // every chunk older than the window and never decompresses the archive to
+        // answer. The window is wider than the staleness the check is looking
+        // for, so the answer is the same; without it this scanned a table that
+        // grows for ever, on every run.
         "SELECT EXTRACT(EPOCH FROM (now() - max(source_observed_at)))::float8 / 3600.0
            FROM ingest_polls
-          WHERE source_observed_at IS NOT NULL",
+          WHERE source_observed_at IS NOT NULL
+            AND polled_at > now() - INTERVAL '3 days'",
     )
     .fetch_one(pool)
     .await?;

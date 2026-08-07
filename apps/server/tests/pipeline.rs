@@ -1282,3 +1282,190 @@ async fn a_run_that_rejects_everything_it_read_degrades() {
     );
     db.cleanup().await;
 }
+
+/// Replay reads `price_keys` off the run row. Written only at close, a run
+/// killed part way through, which is exactly what the reaper exists for, left
+/// its archived payloads sitting in the bucket with nothing pointing at them.
+#[tokio::test]
+async fn a_run_that_never_closes_still_records_what_it_archived() {
+    let db = TestDb::new().await.unwrap();
+    let (run, _) = db::open_run(&db.pool, "test", "test/1").await.unwrap();
+
+    db::record_request(&db.pool, run).await.unwrap();
+    db::record_price_key(&db.pool, run, "raw/test/2026/01/05/a-0.json.zst")
+        .await
+        .unwrap();
+    db::record_step(&db.pool, run, "discovery_ran")
+        .await
+        .unwrap();
+
+    // The run is killed here. close_run never happens; the reaper finds it.
+    assert_eq!(db::reap_abandoned_runs(&db.pool).await.unwrap(), 0);
+    sqlx::query("UPDATE ingest_runs SET heartbeat_at = now() - INTERVAL '2 hours'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db::reap_abandoned_runs(&db.pool).await.unwrap(), 1);
+
+    let recorded = db::run_replay_source(&db.pool, run).await.unwrap().unwrap();
+    assert_eq!(
+        recorded.keys,
+        vec!["raw/test/2026/01/05/a-0.json.zst"],
+        "the archive it wrote must still be reachable"
+    );
+    assert_eq!(
+        db::requests_spent_today(&db.pool, "test").await.unwrap(),
+        1,
+        "its spend must still count against the day, or the next run overspends"
+    );
+    assert!(
+        db::seconds_since_step(&db.pool, "test", "discovery_ran")
+            .await
+            .unwrap()
+            .is_some(),
+        "its finished discovery must not be bought again"
+    );
+    db.cleanup().await;
+}
+
+/// Handing one provider's archived payloads to another's parser would rewrite
+/// that run's history under a parser that never saw the shape, and it would look
+/// like a successful replay.
+#[tokio::test]
+async fn replay_refuses_a_run_written_by_a_different_source() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let alpha = TestSource::named(
+        "alpha",
+        vec![Card::new("101", "Marco Verratti").recent(9_000, 3)],
+    );
+    let outcome = run_once(&db, &alpha, &archive).await.unwrap();
+    let RunOutcome::Completed { run_id, .. } = outcome else {
+        panic!("the run must complete")
+    };
+
+    let beta = TestSource::named(
+        "beta",
+        vec![Card::new("101", "Marco Verratti").recent(9_000, 3)],
+    );
+    let config = db.config();
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &archive,
+        source: &beta,
+        config: &config,
+    };
+
+    let error = ingest::replay(&runner, run_id)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("alpha") && error.contains("beta"),
+        "the refusal must name both sources: {error}"
+    );
+    db.cleanup().await;
+}
+
+/// The budget is spent against the persisted count, so a request recorded twice
+/// shrinks the day by two. A cold run does exactly three: the asset list, one
+/// metadata batch, one price batch.
+#[tokio::test]
+async fn every_request_is_counted_exactly_once() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 3)]);
+
+    run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(
+        db::requests_spent_today(&db.pool, "test").await.unwrap(),
+        3,
+        "the asset list, the metadata batch and the price batch, once each"
+    );
+    db.cleanup().await;
+}
+
+/// The step flag suppresses the metadata step for a whole cadence, seven days by
+/// default. A run that stopped early must not set it, or every asset it did not
+/// reach keeps a null rating and version: tiered slowest, and pooled into one
+/// meaningless valuation class until the cadence comes round again.
+#[tokio::test]
+async fn a_metadata_step_that_stopped_early_does_not_mark_itself_done() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let cards: Vec<Card> = (0..6)
+        .map(|i| Card::new(&format!("{}", 100 + i), &format!("Card {i}")).recent(9_000, 3))
+        .collect();
+    // One asset per request, so the budget runs out part way through.
+    let source = TestSource::new(cards).batch_size(1);
+
+    let config = Box::leak(Box::new(Config {
+        // The asset list, then two metadata batches, then nothing.
+        daily_request_budget: 3,
+        ..db.config()
+    }));
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &archive,
+        source: &source,
+        config,
+    };
+    ingest::run(&runner).await.unwrap();
+
+    assert!(
+        db::seconds_since_step(&db.pool, "test", "metadata_ran")
+            .await
+            .unwrap()
+            .is_none(),
+        "a step that ran out of budget must leave itself due"
+    );
+    // Discovery did finish, so it may claim its flag.
+    assert!(
+        db::seconds_since_step(&db.pool, "test", "discovery_ran")
+            .await
+            .unwrap()
+            .is_some(),
+        "a step that did finish should not be bought again"
+    );
+    db.cleanup().await;
+}
+
+/// The budget can be smaller than the due set on a day where the slow steps ate
+/// it. The identifiers that go first must be the ones waiting longest, not the
+/// ones earliest in the alphabet.
+#[tokio::test]
+async fn the_most_overdue_assets_are_polled_first_when_the_budget_is_short() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    // Alphabetically ascending identifiers, so an alphabetical cap would take
+    // "aaa" first, which is the one polled most recently.
+    let source = TestSource::new(vec![
+        Card::new("aaa", "Freshly polled").recent(9_000, 3),
+        Card::new("bbb", "Waiting longest").recent(9_000, 3),
+    ]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let game = db.game().await.unwrap();
+    sqlx::query(
+        "UPDATE asset_poll_state s SET last_polled_at = CASE
+             WHEN si.external_id = 'aaa' THEN now() - INTERVAL '1 hour'
+             ELSE now() - INTERVAL '9 hours' END
+           FROM asset_source_ids si
+          WHERE si.asset_id = s.asset_id",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let due = db::due_external_ids(&db.pool, "test", game.id, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        due,
+        vec!["bbb".to_string()],
+        "the single affordable slot must go to the asset waiting longest"
+    );
+    db.cleanup().await;
+}

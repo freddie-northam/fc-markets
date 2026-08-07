@@ -87,6 +87,20 @@ async fn observations_return_in_chronological_order_and_respect_the_row_cap() {
     let mut sorted = times.clone();
     sorted.sort();
     assert_eq!(times, sorted, "observations must come back oldest first");
+
+    // The cap must take from the NEWEST end. Seeded at 1, 5, 9, 13 and 17 hours
+    // ago with price 10_000 + hours, so the three newest are 10_001, 10_005 and
+    // 10_009. Capping an ascending scan would have returned the three OLDEST
+    // instead, and the caller's "latest price" would be the cap boundary. The
+    // count and the ordering hold either way, which is why this assertion is the
+    // one that catches it.
+    let mut prices: Vec<i64> = rows.iter().map(|r| r["price"].as_i64().unwrap()).collect();
+    prices.sort();
+    assert_eq!(
+        prices,
+        vec![10_001, 10_005, 10_009],
+        "the cap must drop the oldest rows, never the newest"
+    );
     server.stop();
     db.cleanup().await;
 }

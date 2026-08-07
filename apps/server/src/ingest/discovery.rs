@@ -52,6 +52,8 @@ pub(crate) async fn maybe_discover(
         return Ok(());
     }
     tally.requests += 1;
+    db::record_request(runner.pool, run_id).await?;
+    db::touch_heartbeat(runner.pool, run_id).await?;
 
     let envelope = match runner.source.fetch_asset_list().await {
         Ok(envelope) => envelope,
@@ -110,6 +112,7 @@ pub(crate) async fn maybe_discover(
     }
 
     tally.steps.push(DISCOVERY_STEP);
+    db::record_step(runner.pool, run_id, DISCOVERY_STEP).await?;
     info!(listed = listings.len(), added, "asset discovery finished");
     Ok(())
 }
@@ -150,26 +153,41 @@ pub(crate) async fn maybe_refresh_metadata(
     .await?;
 
     if stale.is_empty() {
+        // Nothing needs attributes, so the step is genuinely done.
         tally.steps.push(METADATA_STEP);
+        db::record_step(runner.pool, run_id, METADATA_STEP).await?;
         return Ok(());
     }
 
     let mut updated = 0;
+    // Only a step that got all the way through may mark itself done. The flag
+    // suppresses the step for a whole cadence, so a run that stopped early on
+    // budget or a rate limit would leave every remaining asset without
+    // attributes for a week: null rating and version, every one tiered slowest,
+    // and one meaningless valuation class holding all of them.
+    let mut complete = true;
     for (batch, chunk) in stale.chunks(batch_size).enumerate() {
         if !budget.take() {
             tally.degrade("the daily request budget stopped the metadata step");
+            complete = false;
             break;
         }
         tally.requests += 1;
+        db::record_request(runner.pool, run_id).await?;
+        // The reaper only sees the heartbeat. A metadata refresh that walks the
+        // catalogue can outlast ABANDON_AFTER before the price loop ever runs.
+        db::touch_heartbeat(runner.pool, run_id).await?;
 
         let envelope = match runner.source.fetch_metadata(chunk).await {
             Ok(envelope) => envelope,
             Err(FetchError::RateLimited) => {
                 tally.degrade("the provider rate limited the metadata step");
+                complete = false;
                 break;
             }
             Err(FetchError::Other(e)) => {
                 tally.degrade(format!("metadata batch {batch} could not be fetched: {e}"));
+                complete = false;
                 continue;
             }
         };
@@ -188,6 +206,7 @@ pub(crate) async fn maybe_refresh_metadata(
             tally.degrade(format!(
                 "metadata batch {batch} was not archived, so it was not parsed: {e}"
             ));
+            complete = false;
             continue;
         }
 
@@ -197,6 +216,7 @@ pub(crate) async fn maybe_refresh_metadata(
             Ok(parsed) => parsed,
             Err(e) => {
                 tally.degrade(format!("metadata batch {batch} could not be parsed: {e}"));
+                complete = false;
                 continue;
             }
         };
@@ -213,8 +233,26 @@ pub(crate) async fn maybe_refresh_metadata(
         }
     }
 
-    tally.steps.push(METADATA_STEP);
-    info!(updated, "card attributes refreshed");
+    // Completion is measured against the work, not against the loop. The stale
+    // list was already capped by what the budget could afford, so a run that
+    // processed its whole capped list has still only done a fraction, and
+    // marking the step done there would suppress it for the rest of the cadence.
+    // Anything still missing attributes means the step is not finished.
+    let outstanding = db::assets_needing_metadata(
+        runner.pool,
+        source,
+        game.id,
+        runner.config.metadata_cadence_seconds,
+        1,
+    )
+    .await?;
+    let finished = complete && outstanding.is_empty();
+
+    if finished {
+        tally.steps.push(METADATA_STEP);
+        db::record_step(runner.pool, run_id, METADATA_STEP).await?;
+    }
+    info!(updated, finished, "card attributes refreshed");
     Ok(())
 }
 

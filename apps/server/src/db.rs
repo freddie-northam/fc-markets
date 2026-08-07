@@ -185,6 +185,59 @@ pub async fn close_run(
     Ok(())
 }
 
+/// Records progress on the run row as it happens, not when the run closes.
+///
+/// Three subsystems read this metadata: replay reads `price_keys`, the daily
+/// budget sums `requests`, and the cadence gates read the step flags. Writing it
+/// only in `close_run` meant a run killed part way through, which is exactly the
+/// case the reaper exists for, was reaped with an empty metadata object. Its
+/// archived payloads then sat in the bucket unreplayable, its spend vanished so
+/// the next run overspent the day, and its finished discovery was bought again.
+///
+/// One extra statement per batch and per step, against a per-run row.
+pub async fn record_request(pool: &PgPool, run_id: RunId) -> Result<()> {
+    sqlx::query(
+        "UPDATE ingest_runs
+            SET metadata = jsonb_set(metadata, '{requests}',
+                  to_jsonb(COALESCE((metadata->>'requests')::bigint, 0) + 1))
+          WHERE id = $1",
+    )
+    .bind(run_id.0)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Appends an archived payload's key the moment the object is stored, so the
+/// archive and the record of it cannot disagree.
+pub async fn record_price_key(pool: &PgPool, run_id: RunId, key: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE ingest_runs
+            SET metadata = jsonb_set(metadata, '{price_keys}',
+                  COALESCE(metadata->'price_keys', '[]'::jsonb) || to_jsonb($2::text))
+          WHERE id = $1",
+    )
+    .bind(run_id.0)
+    .bind(key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Marks a slow step finished. The next run reads this to decide its cadence.
+pub async fn record_step(pool: &PgPool, run_id: RunId, step: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE ingest_runs
+            SET metadata = jsonb_set(metadata, ARRAY[$2], 'true'::jsonb)
+          WHERE id = $1",
+    )
+    .bind(run_id.0)
+    .bind(step)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// A killed process leaves a run marked running for ever, which would make the
 /// open-run count meaningless. The next start clears them.
 pub async fn reap_abandoned_runs(pool: &PgPool) -> Result<u64> {
@@ -271,22 +324,31 @@ pub async fn due_external_ids(
     limit: i64,
 ) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar(
-        "SELECT DISTINCT ON (si.external_id) si.external_id
-           FROM asset_poll_state s
-           JOIN assets a ON a.id = s.asset_id
-           JOIN asset_source_ids si
-             ON si.asset_id = s.asset_id AND si.source = $1 AND si.game_id = a.game_id
-          WHERE a.game_id = $2
-            -- consecutive_failures stretches the interval. A card we cannot read
-            -- is retried more slowly each time rather than spending full rate
-            -- quota that a healthy card could use.
-            AND (s.last_polled_at IS NULL
-                 OR s.last_polled_at
-                    + make_interval(secs => s.poll_interval_seconds
-                                            * LEAST(s.consecutive_failures + 1, $4))
-                    <= now())
-          ORDER BY si.external_id, s.last_polled_at NULLS FIRST
-          LIMIT $3",
+        // The LIMIT is applied OUTSIDE the DISTINCT ON. Inside it, the
+        // last_polled_at term only breaks ties within one identifier, because
+        // DISTINCT ON forces external_id to lead the sort. Capping there took the
+        // alphabetically lowest identifiers, so on a day where discovery and the
+        // metadata step had eaten the budget, a card unread for four hours lost
+        // its slot to one that came due a second ago.
+        "SELECT external_id FROM (
+             SELECT DISTINCT ON (si.external_id) si.external_id, s.last_polled_at
+               FROM asset_poll_state s
+               JOIN assets a ON a.id = s.asset_id
+               JOIN asset_source_ids si
+                 ON si.asset_id = s.asset_id AND si.source = $1 AND si.game_id = a.game_id
+              WHERE a.game_id = $2
+                -- consecutive_failures stretches the interval. A card we cannot
+                -- read is retried more slowly each time rather than spending full
+                -- rate quota that a healthy card could use.
+                AND (s.last_polled_at IS NULL
+                     OR s.last_polled_at
+                        + make_interval(secs => s.poll_interval_seconds
+                                                * LEAST(s.consecutive_failures + 1, $4))
+                        <= now())
+              ORDER BY si.external_id, s.last_polled_at NULLS FIRST
+         ) due
+         ORDER BY due.last_polled_at NULLS FIRST
+         LIMIT $3",
     )
     .bind(source)
     .bind(game.0)
@@ -852,20 +914,28 @@ pub async fn resolve_targets(
 ///
 /// One row, one query. Rule 2 bounds timestamps against the ORIGINAL start, so
 /// these two facts are only ever wanted together.
-pub async fn run_replay_source(
-    pool: &PgPool,
-    run_id: RunId,
-) -> Result<Option<(DateTime<Utc>, Vec<String>)>> {
-    let row: Option<(DateTime<Utc>, Option<serde_json::Value>)> =
-        sqlx::query_as("SELECT started_at, metadata->'price_keys' FROM ingest_runs WHERE id = $1")
-            .bind(run_id.0)
-            .fetch_optional(pool)
-            .await?;
+pub struct ReplaySource {
+    pub started_at: DateTime<Utc>,
+    /// Which provider wrote the run. Replay must re-parse with the same one:
+    /// handing run A's payloads to source B's parser rewrites A's history under
+    /// a parser that never saw that shape, silently.
+    pub source: String,
+    pub keys: Vec<String>,
+}
 
-    Ok(row.map(|(started_at, keys)| {
-        let keys = keys
+pub async fn run_replay_source(pool: &PgPool, run_id: RunId) -> Result<Option<ReplaySource>> {
+    let row: Option<(DateTime<Utc>, String, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT started_at, source, metadata->'price_keys' FROM ingest_runs WHERE id = $1",
+    )
+    .bind(run_id.0)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(started_at, source, keys)| ReplaySource {
+        started_at,
+        source,
+        keys: keys
             .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
-            .unwrap_or_default();
-        (started_at, keys)
+            .unwrap_or_default(),
     }))
 }
