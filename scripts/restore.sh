@@ -38,6 +38,27 @@ export PGHOST PGPORT PGUSER
 
 [ -f "$DUMP" ] || { echo "no dump at $DUMP" >&2; exit 1; }
 
+# The target is interpolated into DROP DATABASE below. Constrain it to a plain
+# identifier so a quote cannot escape the quoted form, and so a typo cannot name
+# something unexpected.
+case "$TARGET" in
+    [a-z_]*) ;;
+    *) echo "target must start with a letter or underscore: $TARGET" >&2; exit 1 ;;
+esac
+if ! printf '%s' "$TARGET" | grep -qE '^[a-z_][a-z0-9_]*$'; then
+    echo "target must be a plain lower case identifier: $TARGET" >&2
+    exit 1
+fi
+
+# Restoring ON TOP of the live database would drop it, with FORCE, while the
+# server is running. That is a thing somebody does once, at night, by reflex.
+LIVE_DB=${LIVE_DB:-fcmarket}
+if [ "$TARGET" = "$LIVE_DB" ] && [ "${I_MEAN_IT:-}" != "yes" ]; then
+    echo "refusing to restore over the live database '$LIVE_DB'." >&2
+    echo "restore into a new name and swap, or re-run with I_MEAN_IT=yes." >&2
+    exit 1
+fi
+
 echo "restoring $DUMP into $TARGET"
 
 # WITH (FORCE) because the TimescaleDB background worker holds a session open
