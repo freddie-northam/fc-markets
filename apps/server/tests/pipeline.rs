@@ -5,6 +5,7 @@ mod common;
 use chrono::{Duration, Utc};
 use common::*;
 use fc_market::archive::Archive;
+use fc_market::config::Config;
 use fc_market::db;
 use fc_market::domain::{Observation, Poll, PollResult};
 use fc_market::ids::{AssetId, Platform, PollOutcome, RunStatus};
@@ -27,6 +28,51 @@ async fn run_once(
         config: &config,
     };
     ingest::run(&runner).await
+}
+
+/// Why a run degraded, as it recorded on itself. Asserting the status alone is
+/// too weak: several unrelated checks all produce `Degraded`, so a test can keep
+/// passing after the behaviour it names is removed.
+/// A runner whose slow steps are out of cadence, so only the price path runs.
+///
+/// Discovery and the metadata step emit their own degrade messages using the
+/// same words as the price path ("rate limited", "budget", "archived"). With
+/// them in play, a reason assertion passes even when the price path's own
+/// handling has been deleted, which is exactly how these tests used to lie.
+fn price_path_only<'a>(
+    db: &'a TestDb,
+    source: &'a TestSource,
+    archive: &'a dyn Archive,
+) -> Runner<'a> {
+    Runner {
+        pool: &db.pool,
+        archive,
+        source,
+        config: Box::leak(Box::new(Config {
+            discovery_cadence_seconds: 86_400,
+            metadata_cadence_seconds: 604_800,
+            ..db.config()
+        })),
+    }
+}
+
+/// Asserts the newest run recorded exactly this reason.
+async fn assert_reason(db: &TestDb, expected: &str) {
+    let reasons = degraded_reasons(db).await;
+    assert!(
+        reasons.iter().any(|r| r == expected),
+        "expected the run to record {expected:?}, got {reasons:?}"
+    );
+}
+
+async fn degraded_reasons(db: &TestDb) -> Vec<String> {
+    let raw: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata->'degraded_reasons' FROM ingest_runs ORDER BY started_at DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the newest run");
+    serde_json::from_value(raw).unwrap_or_default()
 }
 
 fn status(outcome: &RunOutcome) -> RunStatus {
@@ -255,6 +301,17 @@ async fn the_tier_expression_follows_the_rating_and_the_version() {
     assert_eq!(by_name["Elite"], 900);
     assert_eq!(by_name["Mid"], 3_600);
     assert_eq!(by_name["Filler"], 14_400);
+    assert_eq!(
+        db.count(
+            "SELECT count(*) FROM (
+               SELECT asset_id FROM asset_poll_state
+                GROUP BY asset_id HAVING count(DISTINCT poll_interval_seconds) > 1
+             ) x"
+        )
+        .await,
+        0,
+        "the spec row is exactly one tier per asset, across every market"
+    );
     db.cleanup().await;
 }
 
@@ -709,9 +766,19 @@ async fn a_failed_archive_write_stops_the_batch_and_marks_the_run_degraded() {
     make_everything_due(&db.pool).await.unwrap();
     let before = db.count("SELECT count(*) FROM market_observations").await;
 
-    let outcome = run_once(&db, &source, &RefusingArchive).await.unwrap();
+    let outcome = ingest::run(&price_path_only(&db, &source, &RefusingArchive))
+        .await
+        .unwrap();
 
     assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.starts_with("batch 0 was not archived")),
+        "the price path must name its own archive failure: {:?}",
+        degraded_reasons(&db).await
+    );
     assert_eq!(
         db.count("SELECT count(*) FROM market_observations").await,
         before,
@@ -727,18 +794,20 @@ async fn a_failed_archive_write_stops_the_batch_and_marks_the_run_degraded() {
 async fn a_rate_limited_provider_stops_the_run_and_marks_it_degraded() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
-        PS,
-        9_000,
-        "2026-01-05T09:00:00Z",
-    )]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 3)]);
     run_once(&db, &source, &archive).await.unwrap();
 
     make_everything_due(&db.pool).await.unwrap();
     source.set_rate_limited(true);
-    let outcome = run_once(&db, &source, &archive).await.unwrap();
+    let outcome = ingest::run(&price_path_only(&db, &source, &archive))
+        .await
+        .unwrap();
 
     assert_eq!(status(&outcome), RunStatus::Degraded);
+    // The exact reason. Asserting the status alone kept this test green with the
+    // rate-limit handling deleted, because several unrelated checks also degrade
+    // a run, and the slow steps emit their own "rate limited" wording.
+    assert_reason(&db, "the provider rate limited this run").await;
     db.cleanup().await;
 }
 
@@ -749,8 +818,8 @@ async fn the_daily_request_budget_stops_a_run() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "One").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-        Card::new("102", "Two").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
+        Card::new("101", "One").recent(9_000, 3),
+        Card::new("102", "Two").recent(9_000, 3),
     ])
     .batch_size(1);
     run_once(&db, &source, &archive).await.unwrap();
@@ -758,15 +827,13 @@ async fn the_daily_request_budget_stops_a_run() {
     let spent = db::requests_spent_today(&db.pool, "test").await.unwrap();
     assert!(spent > 0, "a run must record what it spent");
 
-    let mut config = db.config();
-    config.daily_request_budget = spent as u32;
     make_everything_due(&db.pool).await.unwrap();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let mut runner = price_path_only(&db, &source, &archive);
+    let config = Box::leak(Box::new(Config {
+        daily_request_budget: spent as u32,
+        ..runner.config.clone()
+    }));
+    runner.config = config;
     let outcome = ingest::run(&runner).await.unwrap();
 
     assert_eq!(
@@ -774,6 +841,11 @@ async fn the_daily_request_budget_stops_a_run() {
         RunStatus::Degraded,
         "the day's budget is already spent, so this run must stop and say so"
     );
+    assert_reason(
+        &db,
+        "the daily request budget was already spent, so no price was read",
+    )
+    .await;
     db.cleanup().await;
 }
 
@@ -1045,5 +1117,168 @@ async fn a_compressed_chunk_still_accepts_a_restatement_and_a_replay() {
         "replay must be able to remove rows from a compressed chunk"
     );
 
+    db.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Drift (section 4.9)
+// ---------------------------------------------------------------------------
+//
+// These four checks are the only alarm the product has. A degraded run withholds
+// the heartbeat, so if one of them silently stops working, a dead feed looks
+// exactly like a healthy one and the dead man's switch stays green.
+
+/// Cards priced `hours` ago, one per entry of `prices`.
+fn priced(prices: &[i64], hours: i64) -> Vec<Card> {
+    prices
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Card::new(&format!("{}", 100 + i), &format!("Card {i}")).recent(*p, hours))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_feed_that_mostly_returns_no_price_degrades_the_run() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+
+    // Three cards priced, four returning nothing: 8 of 14 reads carry no price,
+    // past the half that the check allows.
+    let mut cards = priced(&[10_000, 11_000, 12_000], 2);
+    for i in 0..4 {
+        cards.push(
+            Card::new(&format!("{}", 900 + i), &format!("Empty {i}"))
+                .no_price(PS, "2026-01-05T09:00:00Z"),
+        );
+    }
+    let outcome = run_once(&db, &TestSource::new(cards), &archive)
+        .await
+        .unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.contains("carried no price")),
+        "{:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+/// A quiet market is NOT this. Section 4.9 warns that a held price is correct
+/// behaviour, so the check has to measure the whole feed over a day, not one run.
+#[tokio::test]
+async fn a_feed_where_nothing_has_moved_for_a_day_degrades_the_run() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(priced(&[10_000, 11_000, 12_000], 30));
+
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.contains("has moved for")),
+        "{:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_quiet_market_inside_the_window_stays_healthy() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(priced(&[10_000, 11_000, 12_000], 6));
+
+    run_once(&db, &source, &archive).await.unwrap();
+    make_everything_due(&db.pool).await.unwrap();
+    // The identical payload again: every price held, nothing advanced.
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(
+        status(&outcome),
+        RunStatus::Ok,
+        "a market where nothing moved is healthy, not frozen: {:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_source_serving_one_price_for_everything_degrades_the_run() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    // Ten cards, all at one price: twenty observations, two distinct values.
+    let source = TestSource::new(priced(&[7_000; 10], 2));
+
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.contains("looks frozen")),
+        "{:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+/// A provider that changes units, or starts serving a different field, moves
+/// every asset at once. A real market does not.
+#[tokio::test]
+async fn a_whole_feed_repricing_at_once_degrades_the_run() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let base: Vec<i64> = (0..10).map(|i| 10_000 + i * 1_000).collect();
+    let source = TestSource::new(priced(&base, 6));
+    run_once(&db, &source, &archive).await.unwrap();
+
+    // Every price multiplied by five, which no market does in one poll.
+    let moved: Vec<i64> = base.iter().map(|p| p * 5).collect();
+    source.set_cards(priced(&moved, 2));
+    make_everything_due(&db.pool).await.unwrap();
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.contains("median asset moved by a factor")),
+        "{:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+/// A run that read something and rejected all of it is not healthy, even though
+/// no step returned an error.
+#[tokio::test]
+async fn a_run_that_rejects_everything_it_read_degrades() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![
+        Card::new("101", "Undated")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
+        Card::new("102", "Also undated")
+            .undated(PS, 8_000)
+            .undated(PC, 8_000),
+    ]);
+
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        0
+    );
     db.cleanup().await;
 }

@@ -55,10 +55,14 @@ impl Config {
 
         Ok(Self {
             database_url: req("DATABASE_URL")?,
-            object_store_endpoint: opt("OBJECT_STORE_ENDPOINT", "http://localhost:9002"),
-            object_store_bucket: opt("OBJECT_STORE_BUCKET", "fc-market-raw"),
-            object_store_access_key: opt("OBJECT_STORE_ACCESS_KEY", "fcmarket"),
-            object_store_secret_key: opt("OBJECT_STORE_SECRET_KEY", "fcmarketsecret"),
+            // Required, not defaulted. A default would let a production
+            // deployment that missed one variable authenticate with the
+            // development credentials printed in .env.example, and succeed
+            // quietly if the store happened to accept them.
+            object_store_endpoint: req("OBJECT_STORE_ENDPOINT")?,
+            object_store_bucket: req("OBJECT_STORE_BUCKET")?,
+            object_store_access_key: req("OBJECT_STORE_ACCESS_KEY")?,
+            object_store_secret_key: req("OBJECT_STORE_SECRET_KEY")?,
             source_api_key: std::env::var("SOURCE_API_KEY").ok(),
             daily_request_budget: num("DAILY_REQUEST_BUDGET", 18_000)?,
             http_timeout: Duration::from_secs(num("HTTP_TIMEOUT_SECONDS", 30)?),

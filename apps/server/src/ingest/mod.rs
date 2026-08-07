@@ -344,17 +344,14 @@ async fn ingest_batch(
                 let observed = quote.observed_at;
                 match validate(game, target, quote, started_at) {
                     Ok((price, observed_at)) => (
-                        PollResult::Priced(Observation {
-                            asset_id: target.asset_id,
-                            market_id: target.market_id,
-                            source: runner.source.name(),
-                            observed_at,
+                        PollResult::Priced(observation(
+                            target,
+                            quote,
                             price,
-                            min_price: quote.min_price,
-                            max_price: quote.max_price,
-                            source_ref: Some(quote.external_id.clone()),
-                            ingest_run_id: run_id,
-                        }),
+                            observed_at,
+                            runner.source.name(),
+                            run_id,
+                        )),
                         observed,
                     ),
                     Err(why) => {
@@ -441,10 +438,9 @@ pub async fn replay(runner: &Runner<'_>, original: RunId) -> Result<ReplayReport
 }
 
 async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayReport> {
-    let started_at = db::run_started_at(runner.pool, original)
+    let (started_at, keys) = db::run_replay_source(runner.pool, original)
         .await?
         .with_context(|| format!("no run {original}"))?;
-    let keys = db::run_archive_keys(runner.pool, original).await?;
     if keys.is_empty() {
         anyhow::bail!("run {original} archived no price payloads, so there is nothing to replay");
     }
@@ -489,17 +485,14 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
                     tally.rejected += 1;
                     log_rejection(&mut tally, &target.external_id, why);
                 }
-                Ok((price, observed_at)) => observations.push(Observation {
-                    asset_id: target.asset_id,
-                    market_id: target.market_id,
-                    source: runner.source.name(),
-                    observed_at,
+                Ok((price, observed_at)) => observations.push(observation(
+                    target,
+                    quote,
                     price,
-                    min_price: quote.min_price,
-                    max_price: quote.max_price,
-                    source_ref: Some(quote.external_id.clone()),
-                    ingest_run_id: replacement,
-                }),
+                    observed_at,
+                    runner.source.name(),
+                    replacement,
+                )),
             }
         }
         replacements.extend(observations);
@@ -537,6 +530,32 @@ fn index_quotes(quotes: &[ParsedQuote]) -> HashMap<(&str, Platform), &ParsedQuot
         .iter()
         .map(|q| ((q.external_id.as_str(), q.platform), q))
         .collect()
+}
+
+/// Builds the canonical row from a validated quote.
+///
+/// Ingest and replay both call this. Replay's entire promise is that it
+/// reproduces what ingest wrote, so a field set in one construction site and
+/// missed in the other would break exactly that guarantee, in silence.
+fn observation(
+    target: &PollTarget,
+    quote: &ParsedQuote,
+    price: i64,
+    observed_at: DateTime<Utc>,
+    source: &'static str,
+    run_id: RunId,
+) -> Observation {
+    Observation {
+        asset_id: target.asset_id,
+        market_id: target.market_id,
+        source,
+        observed_at,
+        price,
+        min_price: quote.min_price,
+        max_price: quote.max_price,
+        source_ref: Some(quote.external_id.clone()),
+        ingest_run_id: run_id,
+    }
 }
 
 /// Applies rules 1, 2 and 3 to one quote.

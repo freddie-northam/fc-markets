@@ -55,7 +55,7 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
         Ok(Some(age)) => {
             let limit = db::largest_poll_interval_seconds(&s.pool)
                 .await
-                .unwrap_or(14_400);
+                .unwrap_or(db::DEFAULT_POLL_INTERVAL_SECONDS);
             if age > f64::from(limit) {
                 reasons.push(format!("no poll for {age:.0}s, limit {limit}s"));
             }
@@ -114,10 +114,18 @@ struct Asset {
     position: Option<String>,
 }
 
+/// Capped like every other list. Discovery records an `assets` row for the
+/// provider's whole catalogue, not just the covered few hundred, so without a
+/// bound this is the one endpoint that would serialise tens of thousands of rows
+/// on the host that also runs ingestion.
 async fn list_assets(State(s): State<AppState>) -> Result<Json<Vec<Asset>>, ApiError> {
     let rows = sqlx::query_as::<_, Asset>(
-        "SELECT id, name, rating, rarity, version, position FROM assets ORDER BY rating DESC NULLS LAST, name",
+        "SELECT id, name, rating, rarity, version, position
+           FROM assets
+          ORDER BY rating DESC NULLS LAST, name
+          LIMIT $1",
     )
+    .bind(s.config.api_row_cap)
     .fetch_all(&s.pool)
     .await?;
     Ok(Json(rows))
