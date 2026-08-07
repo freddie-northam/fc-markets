@@ -10,7 +10,7 @@
 //! on a provider we intend to be able to replace.
 
 use crate::archive::Envelope;
-use crate::domain::{AssetAttributes, Rarity};
+use crate::domain::{AssetAttributes, Rarity, canonical_version};
 use crate::ids::Platform;
 use crate::source::{FetchError, FetchResult, Listing, ParsedQuote, Source};
 use anyhow::{Context, Result};
@@ -143,7 +143,10 @@ impl Source for FixtureSource {
     }
 
     async fn fetch_prices(&self, external_ids: &[String]) -> FetchResult {
-        let body = self.read_json("prices.json").await.map_err(FetchError::Other)?;
+        let body = self
+            .read_json("prices.json")
+            .await
+            .map_err(FetchError::Other)?;
         Ok(Envelope::new(
             self.url("prices.json"),
             external_ids.to_vec(),
@@ -154,14 +157,14 @@ impl Source for FixtureSource {
     }
 
     fn parse_prices(&self, envelope: &Envelope) -> Result<Vec<ParsedQuote>> {
-        let records: Vec<PriceRecord> = serde_json::from_value(envelope.body.clone())?;
+        // Borrowed, not cloned: from_value would deep-copy the whole payload,
+        // and this runs on every batch of every run and again on replay.
+        let records: Vec<PriceRecord> = Vec::deserialize(&envelope.body)?;
         let mut out = Vec::with_capacity(records.len() * 2);
 
         for r in records {
-            for (platform, quote) in [
-                (Platform::Playstation, r.playstation),
-                (Platform::Pc, r.pc),
-            ] {
+            for (platform, quote) in [(Platform::Playstation, r.playstation), (Platform::Pc, r.pc)]
+            {
                 let Some(q) = quote else { continue };
                 out.push(ParsedQuote {
                     external_id: r.id.clone(),
@@ -178,7 +181,10 @@ impl Source for FixtureSource {
     }
 
     async fn fetch_asset_list(&self) -> FetchResult {
-        let body = self.read_json("assets.json").await.map_err(FetchError::Other)?;
+        let body = self
+            .read_json("assets.json")
+            .await
+            .map_err(FetchError::Other)?;
         Ok(Envelope::new(
             self.url("assets.json"),
             Vec::new(),
@@ -189,7 +195,9 @@ impl Source for FixtureSource {
     }
 
     fn parse_asset_list(&self, envelope: &Envelope) -> Result<Vec<Listing>> {
-        let records: Vec<ListingRecord> = serde_json::from_value(envelope.body.clone())?;
+        // Borrowed, not cloned: from_value would deep-copy the whole payload,
+        // and this runs on every batch of every run and again on replay.
+        let records: Vec<ListingRecord> = Vec::deserialize(&envelope.body)?;
         Ok(records
             .into_iter()
             .map(|r| Listing {
@@ -200,7 +208,10 @@ impl Source for FixtureSource {
     }
 
     async fn fetch_metadata(&self, external_ids: &[String]) -> FetchResult {
-        let body = self.read_json("metadata.json").await.map_err(FetchError::Other)?;
+        let body = self
+            .read_json("metadata.json")
+            .await
+            .map_err(FetchError::Other)?;
         Ok(Envelope::new(
             self.url("metadata.json"),
             external_ids.to_vec(),
@@ -214,7 +225,9 @@ impl Source for FixtureSource {
     /// the edge, is what stops a provider change from silently moving assets
     /// between valuation classes.
     fn parse_metadata(&self, envelope: &Envelope) -> Result<Vec<AssetAttributes>> {
-        let records: Vec<MetadataRecord> = serde_json::from_value(envelope.body.clone())?;
+        // Borrowed, not cloned: from_value would deep-copy the whole payload,
+        // and this runs on every batch of every run and again on replay.
+        let records: Vec<MetadataRecord> = Vec::deserialize(&envelope.body)?;
 
         Ok(records
             .into_iter()
@@ -227,7 +240,7 @@ impl Source for FixtureSource {
                     Some("common") => Rarity::Common,
                     _ => Rarity::Rare,
                 },
-                version: r.version.unwrap_or_else(|| "base".to_string()),
+                version: canonical_version(r.version),
                 position: r.position,
                 league_id: r.league,
                 nation_id: r.nation,

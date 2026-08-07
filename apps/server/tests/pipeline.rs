@@ -5,6 +5,7 @@ mod common;
 use chrono::{Duration, Utc};
 use common::*;
 use fc_market::archive::Archive;
+use fc_market::config::Config;
 use fc_market::db;
 use fc_market::domain::{Observation, Poll, PollResult};
 use fc_market::ids::{AssetId, Platform, PollOutcome, RunStatus};
@@ -29,6 +30,51 @@ async fn run_once(
     ingest::run(&runner).await
 }
 
+/// Why a run degraded, as it recorded on itself. Asserting the status alone is
+/// too weak: several unrelated checks all produce `Degraded`, so a test can keep
+/// passing after the behaviour it names is removed.
+/// A runner whose slow steps are out of cadence, so only the price path runs.
+///
+/// Discovery and the metadata step emit their own degrade messages using the
+/// same words as the price path ("rate limited", "budget", "archived"). With
+/// them in play, a reason assertion passes even when the price path's own
+/// handling has been deleted, which is exactly how these tests used to lie.
+fn price_path_only<'a>(
+    db: &'a TestDb,
+    source: &'a TestSource,
+    archive: &'a dyn Archive,
+) -> Runner<'a> {
+    Runner {
+        pool: &db.pool,
+        archive,
+        source,
+        config: Box::leak(Box::new(Config {
+            discovery_cadence_seconds: 86_400,
+            metadata_cadence_seconds: 604_800,
+            ..db.config()
+        })),
+    }
+}
+
+/// Asserts the newest run recorded exactly this reason.
+async fn assert_reason(db: &TestDb, expected: &str) {
+    let reasons = degraded_reasons(db).await;
+    assert!(
+        reasons.iter().any(|r| r == expected),
+        "expected the run to record {expected:?}, got {reasons:?}"
+    );
+}
+
+async fn degraded_reasons(db: &TestDb) -> Vec<String> {
+    let raw: serde_json::Value = sqlx::query_scalar(
+        "SELECT metadata->'degraded_reasons' FROM ingest_runs ORDER BY started_at DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the newest run");
+    serde_json::from_value(raw).unwrap_or_default()
+}
+
 fn status(outcome: &RunOutcome) -> RunStatus {
     match outcome {
         RunOutcome::Completed { status, .. } => *status,
@@ -43,9 +89,11 @@ fn status(outcome: &RunOutcome) -> RunStatus {
 #[tokio::test]
 async fn one_external_identifier_always_maps_to_one_internal_asset() {
     let db = TestDb::new().await.unwrap();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     let archive = MemoryArchive::default();
 
     run_once(&db, &source, &archive).await.unwrap();
@@ -69,15 +117,11 @@ async fn two_sources_map_to_one_internal_asset() {
     );
     run_once(&db, &first, &archive).await.unwrap();
 
-    let asset: AssetId = db::asset_by_external_id(
-        &db.pool,
-        "alpha",
-        db.game().await.unwrap().id,
-        "101",
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let asset: AssetId =
+        db::asset_by_external_id(&db.pool, "alpha", db.game().await.unwrap().id, "101")
+            .await
+            .unwrap()
+            .unwrap();
 
     // The second provider knows the same card by a different identifier. Mapping
     // it onto the existing asset is what keeps one price history per card.
@@ -112,9 +156,11 @@ async fn two_sources_map_to_one_internal_asset() {
 async fn the_same_external_identifier_in_two_games_maps_to_two_assets() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     // The next title reuses identifier 101 for a different card. Without game_id
@@ -147,9 +193,11 @@ async fn the_same_external_identifier_in_two_games_maps_to_two_assets() {
 async fn a_payload_whose_name_disagrees_with_the_resolved_asset_is_rejected() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     // The provider re-points identifier 101 at a different footballer. Rule 1
@@ -184,12 +232,16 @@ async fn a_payload_whose_rating_disagrees_is_accepted() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").rating(84).recent(9_000, 6),
+        Card::new("101", "Marco Verratti")
+            .rating(84)
+            .recent(9_000, 6),
     ]);
     run_once(&db, &source, &archive).await.unwrap();
 
     source.set_cards(vec![
-        Card::new("101", "Marco Verratti").rating(88).recent(40_000, 3),
+        Card::new("101", "Marco Verratti")
+            .rating(88)
+            .recent(40_000, 3),
     ]);
     make_everything_due(&db.pool).await.unwrap();
     let outcome = run_once(&db, &source, &archive).await.unwrap();
@@ -249,6 +301,17 @@ async fn the_tier_expression_follows_the_rating_and_the_version() {
     assert_eq!(by_name["Elite"], 900);
     assert_eq!(by_name["Mid"], 3_600);
     assert_eq!(by_name["Filler"], 14_400);
+    assert_eq!(
+        db.count(
+            "SELECT count(*) FROM (
+               SELECT asset_id FROM asset_poll_state
+                GROUP BY asset_id HAVING count(DISTINCT poll_interval_seconds) > 1
+             ) x"
+        )
+        .await,
+        0,
+        "the spec row is exactly one tier per asset, across every market"
+    );
     db.cleanup().await;
 }
 
@@ -326,9 +389,11 @@ async fn one_payload_ingested_twice_does_not_double_the_observation_count() {
 async fn the_unique_constraint_still_rejects_a_duplicate_after_chunk_compression() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     let compressed: i64 = sqlx::query_scalar(
@@ -363,14 +428,18 @@ async fn the_unique_constraint_still_rejects_a_duplicate_after_chunk_compression
 async fn a_different_price_at_the_same_timestamp_lands_as_a_second_row() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
-    source.set_cards(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_400, "2026-01-05T09:00:00Z"),
-    ]);
+    source.set_cards(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_400,
+        "2026-01-05T09:00:00Z",
+    )]);
     make_everything_due(&db.pool).await.unwrap();
     run_once(&db, &source, &archive).await.unwrap();
 
@@ -386,9 +455,11 @@ async fn a_different_price_at_the_same_timestamp_lands_as_a_second_row() {
 async fn an_old_observed_at_and_a_current_ingested_at_stay_separate() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2025-10-01T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2025-10-01T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     let (observed, ingested): (chrono::DateTime<Utc>, chrono::DateTime<Utc>) =
@@ -467,7 +538,9 @@ async fn a_missing_source_timestamp_is_rejected_and_counted() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "Undated").undated(PS, 9_000).undated(PC, 9_000),
+        Card::new("101", "Undated")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
     ]);
     run_once(&db, &source, &archive).await.unwrap();
 
@@ -477,8 +550,10 @@ async fn a_missing_source_timestamp_is_rejected_and_counted() {
         "we never substitute our own clock for a missing source timestamp"
     );
     assert_eq!(
-        db.count("SELECT records_rejected::bigint FROM ingest_runs ORDER BY started_at DESC LIMIT 1")
-            .await,
+        db.count(
+            "SELECT records_rejected::bigint FROM ingest_runs ORDER BY started_at DESC LIMIT 1"
+        )
+        .await,
         2
     );
     assert_eq!(
@@ -497,9 +572,11 @@ async fn a_missing_source_timestamp_is_rejected_and_counted() {
 async fn an_unchanged_price_writes_a_poll_row_with_outcome_unchanged() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
     make_everything_due(&db.pool).await.unwrap();
     run_once(&db, &source, &archive).await.unwrap();
@@ -523,7 +600,9 @@ async fn a_rejected_record_writes_a_poll_row_with_its_own_outcome() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "Undated").undated(PS, 9_000).undated(PC, 9_000),
+        Card::new("101", "Undated")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
         Card::new("102", "Priceless")
             .no_price(PS, "2026-01-05T09:00:00Z")
             .no_price(PC, "2026-01-05T09:00:00Z"),
@@ -555,7 +634,9 @@ async fn one_bad_record_does_not_fail_the_run() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "Undated").undated(PS, 9_000).undated(PC, 9_000),
+        Card::new("101", "Undated")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
         Card::new("102", "Sound").recent(12_000, 4),
         Card::new("103", "Also sound").recent(13_000, 4),
     ]);
@@ -581,7 +662,10 @@ async fn a_second_run_stops_when_the_advisory_lock_is_held() {
     let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 5)]);
 
     // Hold the lock, exactly as a slow run would.
-    let held = db::try_lock(&db.url).await.unwrap().expect("the lock must be free");
+    let held = db::try_lock(&db.url)
+        .await
+        .unwrap()
+        .expect("the lock must be free");
 
     let outcome = run_once(&db, &source, &archive).await.unwrap();
     assert!(
@@ -604,9 +688,11 @@ async fn a_second_run_stops_when_the_advisory_lock_is_held() {
 async fn a_failure_between_the_writes_leaves_no_poll_row_without_its_observation() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
     run_once(&db, &source, &archive).await.unwrap();
 
     let game = db.game().await.unwrap();
@@ -667,9 +753,11 @@ async fn a_failure_between_the_writes_leaves_no_poll_row_without_its_observation
 #[tokio::test]
 async fn a_failed_archive_write_stops_the_batch_and_marks_the_run_degraded() {
     let db = TestDb::new().await.unwrap();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").quote(
+        PS,
+        9_000,
+        "2026-01-05T09:00:00Z",
+    )]);
 
     // Discover first with a working archive, so the failure under test is the
     // price archive write and nothing else.
@@ -678,9 +766,19 @@ async fn a_failed_archive_write_stops_the_batch_and_marks_the_run_degraded() {
     make_everything_due(&db.pool).await.unwrap();
     let before = db.count("SELECT count(*) FROM market_observations").await;
 
-    let outcome = run_once(&db, &source, &RefusingArchive).await.unwrap();
+    let outcome = ingest::run(&price_path_only(&db, &source, &RefusingArchive))
+        .await
+        .unwrap();
 
     assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.starts_with("batch 0 was not archived")),
+        "the price path must name its own archive failure: {:?}",
+        degraded_reasons(&db).await
+    );
     assert_eq!(
         db.count("SELECT count(*) FROM market_observations").await,
         before,
@@ -696,16 +794,20 @@ async fn a_failed_archive_write_stops_the_batch_and_marks_the_run_degraded() {
 async fn a_rate_limited_provider_stops_the_run_and_marks_it_degraded() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    let source = TestSource::new(vec![
-        Card::new("101", "Marco Verratti").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-    ]);
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 3)]);
     run_once(&db, &source, &archive).await.unwrap();
 
     make_everything_due(&db.pool).await.unwrap();
     source.set_rate_limited(true);
-    let outcome = run_once(&db, &source, &archive).await.unwrap();
+    let outcome = ingest::run(&price_path_only(&db, &source, &archive))
+        .await
+        .unwrap();
 
     assert_eq!(status(&outcome), RunStatus::Degraded);
+    // The exact reason. Asserting the status alone kept this test green with the
+    // rate-limit handling deleted, because several unrelated checks also degrade
+    // a run, and the slow steps emit their own "rate limited" wording.
+    assert_reason(&db, "the provider rate limited this run").await;
     db.cleanup().await;
 }
 
@@ -716,8 +818,8 @@ async fn the_daily_request_budget_stops_a_run() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     let source = TestSource::new(vec![
-        Card::new("101", "One").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
-        Card::new("102", "Two").quote(PS, 9_000, "2026-01-05T09:00:00Z"),
+        Card::new("101", "One").recent(9_000, 3),
+        Card::new("102", "Two").recent(9_000, 3),
     ])
     .batch_size(1);
     run_once(&db, &source, &archive).await.unwrap();
@@ -725,15 +827,13 @@ async fn the_daily_request_budget_stops_a_run() {
     let spent = db::requests_spent_today(&db.pool, "test").await.unwrap();
     assert!(spent > 0, "a run must record what it spent");
 
-    let mut config = db.config();
-    config.daily_request_budget = spent as u32;
     make_everything_due(&db.pool).await.unwrap();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let mut runner = price_path_only(&db, &source, &archive);
+    let config = Box::leak(Box::new(Config {
+        daily_request_budget: spent as u32,
+        ..runner.config.clone()
+    }));
+    runner.config = config;
     let outcome = ingest::run(&runner).await.unwrap();
 
     assert_eq!(
@@ -741,6 +841,11 @@ async fn the_daily_request_budget_stops_a_run() {
         RunStatus::Degraded,
         "the day's budget is already spent, so this run must stop and say so"
     );
+    assert_reason(
+        &db,
+        "the daily request budget was already spent, so no price was read",
+    )
+    .await;
     db.cleanup().await;
 }
 
@@ -813,7 +918,10 @@ async fn replay_keeps_the_original_runs_verdict_on_a_timestamp() {
     let RunOutcome::Completed { run_id, .. } = outcome else {
         panic!("the run must complete")
     };
-    assert_eq!(db.count("SELECT count(*) FROM market_observations").await, 2);
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        2
+    );
 
     // Move the recorded start back behind the quote. The wall clock has not
     // moved, so the two bounds now disagree, and only one of them can be the one
@@ -834,6 +942,530 @@ async fn replay_keeps_the_original_runs_verdict_on_a_timestamp() {
         0,
         "replay must bound against the run's recorded start; a wall clock bound \
          would have kept these rows and made one archive give two tables"
+    );
+    db.cleanup().await;
+}
+
+/// A spent budget must not look like a healthy, quiet run.
+///
+/// With nothing left to spend the due query returns no rows, which reads exactly
+/// like nothing being due. If the run closed `ok` it would send a heartbeat, and
+/// the dead man's switch would stay green while the ledger had stopped.
+#[tokio::test]
+async fn a_run_that_cannot_afford_a_single_request_does_not_close_ok() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 4)]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let mut config = db.config();
+    config.daily_request_budget = 0;
+    // The slow steps are not due, so only the price path is left to notice.
+    config.discovery_cadence_seconds = 86_400;
+    config.metadata_cadence_seconds = 604_800;
+    make_everything_due(&db.pool).await.unwrap();
+
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &archive,
+        source: &source,
+        config: &config,
+    };
+    let outcome = ingest::run(&runner).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    db.cleanup().await;
+}
+
+/// The delete and the rewrite are one transaction. A delete that committed
+/// before a failed rewrite would destroy exactly the rows the replay set out to
+/// correct.
+#[tokio::test]
+async fn a_replay_that_cannot_read_its_archive_leaves_the_ledger_untouched() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![
+        Card::new("101", "Marco Verratti").recent(9_000, 4),
+        Card::new("102", "Bruno Fernandes").recent(15_000, 4),
+    ]);
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+    let RunOutcome::Completed { run_id, .. } = outcome else {
+        panic!("the run must complete")
+    };
+
+    let before = db.count("SELECT count(*) FROM market_observations").await;
+    assert_eq!(before, 4);
+
+    // The object store has gone away between the run and the replay.
+    let config = db.config();
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &RefusingArchive,
+        source: &source,
+        config: &config,
+    };
+    assert!(ingest::replay(&runner, run_id).await.is_err());
+
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        before,
+        "a failed replay must not leave a hole where the history was"
+    );
+    db.cleanup().await;
+}
+
+/// Section 4.5 has no retry policy: the next scheduled poll is the retry, and
+/// `consecutive_failures` supplies the backoff. Without it a permanently broken
+/// card spends full rate quota for ever and crowds out the healthy ones.
+#[tokio::test]
+async fn a_failing_asset_backs_off_while_a_healthy_one_stays_on_its_interval() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![
+        Card::new("101", "Healthy").recent(9_000, 3),
+        Card::new("102", "Broken")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
+    ]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    // Both were polled just now. Wind the clock back by one interval: the healthy
+    // card is due again, the failing one is not, because its interval doubled.
+    sqlx::query(
+        "UPDATE asset_poll_state
+            SET last_polled_at = now() - make_interval(secs => poll_interval_seconds + 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let game = db.game().await.unwrap();
+    let due = db::due_external_ids(&db.pool, "test", game.id, 100)
+        .await
+        .unwrap();
+
+    assert!(due.contains(&"101".to_string()), "the healthy card is due");
+    assert!(
+        !due.contains(&"102".to_string()),
+        "the failing card must wait longer than its base interval"
+    );
+
+    // Far enough back and even a failing card is retried. A backoff that never
+    // ends is an asset silently dropped from coverage.
+    sqlx::query(
+        "UPDATE asset_poll_state
+            SET last_polled_at = now() - make_interval(secs => poll_interval_seconds * 20)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let due = db::due_external_ids(&db.pool, "test", game.id, 100)
+        .await
+        .unwrap();
+    assert!(
+        due.contains(&"102".to_string()),
+        "the retry must come round"
+    );
+
+    db.cleanup().await;
+}
+
+/// Compression is applied to chunks older than 30 days, and the ledger is kept
+/// for ever, so almost every row will live in a compressed chunk. A restatement
+/// or a replay that could not touch one would mean the archive stops being able
+/// to correct the ledger after a month.
+#[tokio::test]
+async fn a_compressed_chunk_still_accepts_a_restatement_and_a_replay() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 6)]);
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+    let RunOutcome::Completed { run_id, .. } = outcome else {
+        panic!("the run must complete")
+    };
+
+    let compressed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT compress_chunk(c) FROM show_chunks('market_observations') c) s",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the chunk must compress");
+    assert!(compressed > 0);
+
+    // A genuine restatement: the same instant, a corrected price.
+    source.set_cards(vec![Card::new("101", "Marco Verratti").recent(9_000, 6)]);
+    let corrected = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_400, 6)]);
+    make_everything_due(&db.pool).await.unwrap();
+    run_once(&db, &corrected, &archive).await.unwrap();
+
+    assert!(
+        db.count("SELECT count(*) FROM market_observations").await > 2,
+        "a corrected price must still land in a compressed chunk"
+    );
+
+    // And replay must still be able to delete out of one.
+    let config = db.config();
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &archive,
+        source: &source,
+        config: &config,
+    };
+    let report = ingest::replay(&runner, run_id).await.unwrap();
+    assert!(
+        report.deleted > 0,
+        "replay must be able to remove rows from a compressed chunk"
+    );
+
+    db.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Drift (section 4.9)
+// ---------------------------------------------------------------------------
+//
+// These four checks are the only alarm the product has. A degraded run withholds
+// the heartbeat, so if one of them silently stops working, a dead feed looks
+// exactly like a healthy one and the dead man's switch stays green.
+
+/// Cards priced `hours` ago, one per entry of `prices`.
+fn priced(prices: &[i64], hours: i64) -> Vec<Card> {
+    prices
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Card::new(&format!("{}", 100 + i), &format!("Card {i}")).recent(*p, hours))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_feed_that_mostly_returns_no_price_degrades_the_run() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+
+    // Three cards priced, four returning nothing: 8 of 14 reads carry no price,
+    // past the half that the check allows.
+    let mut cards = priced(&[10_000, 11_000, 12_000], 2);
+    for i in 0..4 {
+        cards.push(
+            Card::new(&format!("{}", 900 + i), &format!("Empty {i}"))
+                .no_price(PS, "2026-01-05T09:00:00Z"),
+        );
+    }
+    let outcome = run_once(&db, &TestSource::new(cards), &archive)
+        .await
+        .unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.contains("carried no price")),
+        "{:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+/// A quiet market is NOT this. Section 4.9 warns that a held price is correct
+/// behaviour, so the check has to measure the whole feed over a day, not one run.
+#[tokio::test]
+async fn a_feed_where_nothing_has_moved_for_a_day_degrades_the_run() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(priced(&[10_000, 11_000, 12_000], 30));
+
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.contains("has moved for")),
+        "{:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_quiet_market_inside_the_window_stays_healthy() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(priced(&[10_000, 11_000, 12_000], 6));
+
+    run_once(&db, &source, &archive).await.unwrap();
+    make_everything_due(&db.pool).await.unwrap();
+    // The identical payload again: every price held, nothing advanced.
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(
+        status(&outcome),
+        RunStatus::Ok,
+        "a market where nothing moved is healthy, not frozen: {:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_source_serving_one_price_for_everything_degrades_the_run() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    // Ten cards, all at one price: twenty observations, two distinct values.
+    let source = TestSource::new(priced(&[7_000; 10], 2));
+
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.contains("looks frozen")),
+        "{:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+/// A provider that changes units, or starts serving a different field, moves
+/// every asset at once. A real market does not.
+#[tokio::test]
+async fn a_whole_feed_repricing_at_once_degrades_the_run() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let base: Vec<i64> = (0..10).map(|i| 10_000 + i * 1_000).collect();
+    let source = TestSource::new(priced(&base, 6));
+    run_once(&db, &source, &archive).await.unwrap();
+
+    // Every price multiplied by five, which no market does in one poll.
+    let moved: Vec<i64> = base.iter().map(|p| p * 5).collect();
+    source.set_cards(priced(&moved, 2));
+    make_everything_due(&db.pool).await.unwrap();
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert!(
+        degraded_reasons(&db)
+            .await
+            .iter()
+            .any(|r| r.contains("median asset moved by a factor")),
+        "{:?}",
+        degraded_reasons(&db).await
+    );
+    db.cleanup().await;
+}
+
+/// A run that read something and rejected all of it is not healthy, even though
+/// no step returned an error.
+#[tokio::test]
+async fn a_run_that_rejects_everything_it_read_degrades() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![
+        Card::new("101", "Undated")
+            .undated(PS, 9_000)
+            .undated(PC, 9_000),
+        Card::new("102", "Also undated")
+            .undated(PS, 8_000)
+            .undated(PC, 8_000),
+    ]);
+
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(status(&outcome), RunStatus::Degraded);
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        0
+    );
+    db.cleanup().await;
+}
+
+/// Replay reads `price_keys` off the run row. Written only at close, a run
+/// killed part way through, which is exactly what the reaper exists for, left
+/// its archived payloads sitting in the bucket with nothing pointing at them.
+#[tokio::test]
+async fn a_run_that_never_closes_still_records_what_it_archived() {
+    let db = TestDb::new().await.unwrap();
+    let (run, _) = db::open_run(&db.pool, "test", "test/1").await.unwrap();
+
+    db::record_request(&db.pool, run).await.unwrap();
+    db::record_price_key(&db.pool, run, "raw/test/2026/01/05/a-0.json.zst")
+        .await
+        .unwrap();
+    db::record_step(&db.pool, run, "discovery_ran")
+        .await
+        .unwrap();
+
+    // The run is killed here. close_run never happens; the reaper finds it.
+    assert_eq!(db::reap_abandoned_runs(&db.pool).await.unwrap(), 0);
+    sqlx::query("UPDATE ingest_runs SET heartbeat_at = now() - INTERVAL '2 hours'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db::reap_abandoned_runs(&db.pool).await.unwrap(), 1);
+
+    let recorded = db::run_replay_source(&db.pool, run).await.unwrap().unwrap();
+    assert_eq!(
+        recorded.keys,
+        vec!["raw/test/2026/01/05/a-0.json.zst"],
+        "the archive it wrote must still be reachable"
+    );
+    assert_eq!(
+        db::requests_spent_today(&db.pool, "test").await.unwrap(),
+        1,
+        "its spend must still count against the day, or the next run overspends"
+    );
+    assert!(
+        db::seconds_since_step(&db.pool, "test", "discovery_ran")
+            .await
+            .unwrap()
+            .is_some(),
+        "its finished discovery must not be bought again"
+    );
+    db.cleanup().await;
+}
+
+/// Handing one provider's archived payloads to another's parser would rewrite
+/// that run's history under a parser that never saw the shape, and it would look
+/// like a successful replay.
+#[tokio::test]
+async fn replay_refuses_a_run_written_by_a_different_source() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let alpha = TestSource::named(
+        "alpha",
+        vec![Card::new("101", "Marco Verratti").recent(9_000, 3)],
+    );
+    let outcome = run_once(&db, &alpha, &archive).await.unwrap();
+    let RunOutcome::Completed { run_id, .. } = outcome else {
+        panic!("the run must complete")
+    };
+
+    let beta = TestSource::named(
+        "beta",
+        vec![Card::new("101", "Marco Verratti").recent(9_000, 3)],
+    );
+    let config = db.config();
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &archive,
+        source: &beta,
+        config: &config,
+    };
+
+    let error = ingest::replay(&runner, run_id)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("alpha") && error.contains("beta"),
+        "the refusal must name both sources: {error}"
+    );
+    db.cleanup().await;
+}
+
+/// The budget is spent against the persisted count, so a request recorded twice
+/// shrinks the day by two. A cold run does exactly three: the asset list, one
+/// metadata batch, one price batch.
+#[tokio::test]
+async fn every_request_is_counted_exactly_once() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 3)]);
+
+    run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(
+        db::requests_spent_today(&db.pool, "test").await.unwrap(),
+        3,
+        "the asset list, the metadata batch and the price batch, once each"
+    );
+    db.cleanup().await;
+}
+
+/// The step flag suppresses the metadata step for a whole cadence, seven days by
+/// default. A run that stopped early must not set it, or every asset it did not
+/// reach keeps a null rating and version: tiered slowest, and pooled into one
+/// meaningless valuation class until the cadence comes round again.
+#[tokio::test]
+async fn a_metadata_step_that_stopped_early_does_not_mark_itself_done() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let cards: Vec<Card> = (0..6)
+        .map(|i| Card::new(&format!("{}", 100 + i), &format!("Card {i}")).recent(9_000, 3))
+        .collect();
+    // One asset per request, so the budget runs out part way through.
+    let source = TestSource::new(cards).batch_size(1);
+
+    let config = Box::leak(Box::new(Config {
+        // The asset list, then two metadata batches, then nothing.
+        daily_request_budget: 3,
+        ..db.config()
+    }));
+    let runner = Runner {
+        pool: &db.pool,
+        archive: &archive,
+        source: &source,
+        config,
+    };
+    ingest::run(&runner).await.unwrap();
+
+    assert!(
+        db::seconds_since_step(&db.pool, "test", "metadata_ran")
+            .await
+            .unwrap()
+            .is_none(),
+        "a step that ran out of budget must leave itself due"
+    );
+    // Discovery did finish, so it may claim its flag.
+    assert!(
+        db::seconds_since_step(&db.pool, "test", "discovery_ran")
+            .await
+            .unwrap()
+            .is_some(),
+        "a step that did finish should not be bought again"
+    );
+    db.cleanup().await;
+}
+
+/// The budget can be smaller than the due set on a day where the slow steps ate
+/// it. The identifiers that go first must be the ones waiting longest, not the
+/// ones earliest in the alphabet.
+#[tokio::test]
+async fn the_most_overdue_assets_are_polled_first_when_the_budget_is_short() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    // Alphabetically ascending identifiers, so an alphabetical cap would take
+    // "aaa" first, which is the one polled most recently.
+    let source = TestSource::new(vec![
+        Card::new("aaa", "Freshly polled").recent(9_000, 3),
+        Card::new("bbb", "Waiting longest").recent(9_000, 3),
+    ]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let game = db.game().await.unwrap();
+    sqlx::query(
+        "UPDATE asset_poll_state s SET last_polled_at = CASE
+             WHEN si.external_id = 'aaa' THEN now() - INTERVAL '1 hour'
+             ELSE now() - INTERVAL '9 hours' END
+           FROM asset_source_ids si
+          WHERE si.asset_id = s.asset_id",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let due = db::due_external_ids(&db.pool, "test", game.id, 1)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        due,
+        vec!["bbb".to_string()],
+        "the single affordable slot must go to the asset waiting longest"
     );
     db.cleanup().await;
 }

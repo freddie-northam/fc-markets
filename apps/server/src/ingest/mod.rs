@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::db::{self, PollTarget};
 use crate::domain::{Observation, Poll, PollResult, Rejection, names_match, timestamp_in_range};
 use crate::ids::{Platform, PollOutcome, RunId, RunStatus};
-use crate::source::{FetchError, Source};
+use crate::source::{FetchError, ParsedQuote, Source};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -35,7 +35,6 @@ pub enum RunOutcome {
     Completed {
         run_id: RunId,
         status: RunStatus,
-        counts: db::RunCounts,
     },
 }
 
@@ -174,24 +173,20 @@ async fn run_locked(runner: &Runner<'_>) -> Result<RunOutcome> {
         tally.status()
     };
 
-    let mut metadata = serde_json::json!({
-        "requests": tally.requests,
-        "price_keys": tally.price_keys,
-        "unchanged": tally.unchanged,
-        "no_price": tally.no_price,
-        "degraded_reasons": tally.degraded,
-    });
-    for step in &tally.steps {
-        metadata[*step] = serde_json::Value::Bool(true);
-    }
-
+    // `requests`, `price_keys` and the step flags are deliberately absent here.
+    // They are written as they happen, so a run that never reaches this point
+    // still leaves them behind. What remains is closing summary only.
     db::close_run(
         runner.pool,
         run_id,
         status,
         tally.counts(),
         error.as_deref(),
-        metadata,
+        serde_json::json!({
+            "unchanged": tally.unchanged,
+            "no_price": tally.no_price,
+            "degraded_reasons": tally.degraded,
+        }),
     )
     .await?;
 
@@ -203,11 +198,7 @@ async fn run_locked(runner: &Runner<'_>) -> Result<RunOutcome> {
         "run closed"
     );
 
-    Ok(RunOutcome::Completed {
-        run_id,
-        status,
-        counts: tally.counts(),
-    })
+    Ok(RunOutcome::Completed { run_id, status })
 }
 
 /// The body of a run, separated so that `run` always closes the record.
@@ -239,6 +230,15 @@ async fn ingest_prices(
     budget: &mut Budget,
     tally: &mut Tally,
 ) -> Result<()> {
+    // Checked before the query, not after it. With nothing left to spend the
+    // query returns no rows, which is indistinguishable from nothing being due,
+    // and the run would close ok and send a heartbeat while the ledger had
+    // stopped. Silence is the alarm, so the run must not look healthy here.
+    if budget.remaining == 0 {
+        tally.degrade("the daily request budget was already spent, so no price was read");
+        return Ok(());
+    }
+
     let batch_size = runner.source.price_batch_size().max(1);
     // Ask for no more identifiers than the day can still pay for.
     let affordable = (budget.remaining as i64).saturating_mul(batch_size as i64);
@@ -257,6 +257,7 @@ async fn ingest_prices(
         }
         db::touch_heartbeat(runner.pool, run_id).await?;
         tally.requests += 1;
+        db::record_request(runner.pool, run_id).await?;
 
         let envelope = match runner.source.fetch_prices(chunk).await {
             Ok(envelope) => envelope,
@@ -284,12 +285,19 @@ async fn ingest_prices(
             started_at,
         );
         if let Err(e) = runner.archive.put(&key, &envelope).await {
-            tally.degrade(format!("batch {batch} was not archived, so it was not parsed: {e}"));
+            tally.degrade(format!(
+                "batch {batch} was not archived, so it was not parsed: {e}"
+            ));
             continue;
         }
+        // Recorded now, not at close. A run killed after this point still has a
+        // replayable archive; recorded only at close, its stored payloads would
+        // be unreachable.
+        db::record_price_key(runner.pool, run_id, &key).await?;
         tally.price_keys.push(key);
 
-        if let Err(e) = ingest_batch(runner, game, run_id, started_at, chunk, &envelope, tally).await
+        if let Err(e) =
+            ingest_batch(runner, game, run_id, started_at, chunk, &envelope, tally).await
         {
             tally.degrade(format!("batch {batch} could not be stored: {e}"));
         }
@@ -315,10 +323,7 @@ async fn ingest_batch(
     let targets =
         db::poll_targets_for(runner.pool, runner.source.name(), game.id, requested).await?;
 
-    let mut by_key: HashMap<(&str, Platform), _> = HashMap::with_capacity(quotes.len());
-    for quote in &quotes {
-        by_key.insert((quote.external_id.as_str(), quote.platform), quote);
-    }
+    let by_key = index_quotes(&quotes);
 
     let polled_at = Utc::now();
     let mut polls = Vec::with_capacity(targets.len());
@@ -335,17 +340,14 @@ async fn ingest_batch(
                 let observed = quote.observed_at;
                 match validate(game, target, quote, started_at) {
                     Ok((price, observed_at)) => (
-                        PollResult::Priced(Observation {
-                            asset_id: target.asset_id,
-                            market_id: target.market_id,
-                            source: runner.source.name(),
-                            observed_at,
+                        PollResult::Priced(observation(
+                            target,
+                            quote,
                             price,
-                            min_price: quote.min_price,
-                            max_price: quote.max_price,
-                            source_ref: Some(quote.external_id.clone()),
-                            ingest_run_id: run_id,
-                        }),
+                            observed_at,
+                            runner.source.name(),
+                            run_id,
+                        )),
                         observed,
                     ),
                     Err(why) => {
@@ -432,25 +434,66 @@ pub async fn replay(runner: &Runner<'_>, original: RunId) -> Result<ReplayReport
 }
 
 async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayReport> {
-    let started_at = db::run_started_at(runner.pool, original)
+    let recorded = db::run_replay_source(runner.pool, original)
         .await?
         .with_context(|| format!("no run {original}"))?;
-    let keys = db::run_archive_keys(runner.pool, original).await?;
+
+    // Re-parsing one provider's payloads with another's parser would rewrite that
+    // run's history under a parser that never saw the shape, and the result would
+    // look like a successful replay.
+    if recorded.source != runner.source.name() {
+        anyhow::bail!(
+            "run {original} was written by source {}, not {}",
+            recorded.source,
+            runner.source.name()
+        );
+    }
+    let (started_at, keys) = (recorded.started_at, recorded.keys);
     if keys.is_empty() {
         anyhow::bail!("run {original} archived no price payloads, so there is nothing to replay");
     }
 
     let game = db::game_by_code(runner.pool, &runner.config.game_code).await?;
-    let (replacement, _) =
-        db::open_run(runner.pool, runner.source.name(), runner.source.parser_version()).await?;
+    let (replacement, _) = db::open_run(
+        runner.pool,
+        runner.source.name(),
+        runner.source.parser_version(),
+    )
+    .await?;
 
-    let mut report = ReplayReport {
-        deleted: db::delete_run_observations(runner.pool, original).await?,
-        rewritten: 0,
-    };
+    // Everything past this point must close the row it just opened. Leaving it
+    // `running` puts a phantom in the open-run count until some later ingest
+    // reaps it an hour on, and each retry of a failing replay adds another.
+    match replay_batches(runner, &game, original, replacement, started_at, &keys).await {
+        Ok(report) => Ok(report),
+        Err(e) => {
+            db::close_run(
+                runner.pool,
+                replacement,
+                RunStatus::Failed,
+                db::RunCounts::default(),
+                Some(&e.to_string()),
+                serde_json::json!({ "replay_of": original.to_string() }),
+            )
+            .await?;
+            Err(e)
+        }
+    }
+}
 
+async fn replay_batches(
+    runner: &Runner<'_>,
+    game: &db::Game,
+    original: RunId,
+    replacement: RunId,
+    started_at: DateTime<Utc>,
+    keys: &[String],
+) -> Result<ReplayReport> {
+    // Everything is read and parsed BEFORE anything is deleted. A failed archive
+    // read must leave the ledger exactly as it was.
+    let mut replacements = Vec::new();
     let mut tally = Tally::default();
-    for key in &keys {
+    for key in keys {
         let envelope = runner.archive.get(key).await?;
         let quotes = runner.source.parse_prices(&envelope)?;
 
@@ -465,38 +508,35 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
         )
         .await?;
 
-        let mut by_key: HashMap<(&str, Platform), _> = HashMap::with_capacity(quotes.len());
-        for quote in &quotes {
-            by_key.insert((quote.external_id.as_str(), quote.platform), quote);
-        }
+        let by_key = index_quotes(&quotes);
 
         let mut observations = Vec::new();
         for target in &targets {
-            let Some(quote) = by_key.get(&(target.external_id.as_str(), target.platform))
-            else {
+            let Some(quote) = by_key.get(&(target.external_id.as_str(), target.platform)) else {
                 continue;
             };
             tally.seen += 1;
-            match validate(&game, target, quote, started_at) {
+            match validate(game, target, quote, started_at) {
                 Err(why) => {
                     tally.rejected += 1;
                     log_rejection(&mut tally, &target.external_id, why);
                 }
-                Ok((price, observed_at)) => observations.push(Observation {
-                    asset_id: target.asset_id,
-                    market_id: target.market_id,
-                    source: runner.source.name(),
-                    observed_at,
+                Ok((price, observed_at)) => observations.push(observation(
+                    target,
+                    quote,
                     price,
-                    min_price: quote.min_price,
-                    max_price: quote.max_price,
-                    source_ref: Some(quote.external_id.clone()),
-                    ingest_run_id: replacement,
-                }),
+                    observed_at,
+                    runner.source.name(),
+                    replacement,
+                )),
             }
         }
-        report.rewritten += db::insert_observations(runner.pool, &observations, replacement).await?;
+        replacements.extend(observations);
     }
+
+    let (deleted, rewritten) =
+        db::replace_run_observations(runner.pool, original, replacement, &replacements).await?;
+    let report = ReplayReport { deleted, rewritten };
 
     tally.written = report.rewritten as i32;
     db::close_run(
@@ -507,7 +547,7 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
         None,
         serde_json::json!({
             "replay_of": original.to_string(),
-            "price_keys": keys,
+            "price_keys": keys.to_vec(),
             "requests": 0,
         }),
     )
@@ -516,11 +556,49 @@ async fn replay_locked(runner: &Runner<'_>, original: RunId) -> Result<ReplayRep
     Ok(report)
 }
 
+/// Indexes quotes by the pair that identifies one market row.
+///
+/// A repeated pair inside one payload keeps the last quote. A provider that
+/// duplicates a record is stating the same thing twice, and the idempotency index
+/// settles it either way.
+fn index_quotes(quotes: &[ParsedQuote]) -> HashMap<(&str, Platform), &ParsedQuote> {
+    quotes
+        .iter()
+        .map(|q| ((q.external_id.as_str(), q.platform), q))
+        .collect()
+}
+
+/// Builds the canonical row from a validated quote.
+///
+/// Ingest and replay both call this. Replay's entire promise is that it
+/// reproduces what ingest wrote, so a field set in one construction site and
+/// missed in the other would break exactly that guarantee, in silence.
+fn observation(
+    target: &PollTarget,
+    quote: &ParsedQuote,
+    price: i64,
+    observed_at: DateTime<Utc>,
+    source: &'static str,
+    run_id: RunId,
+) -> Observation {
+    Observation {
+        asset_id: target.asset_id,
+        market_id: target.market_id,
+        source,
+        observed_at,
+        price,
+        min_price: quote.min_price,
+        max_price: quote.max_price,
+        source_ref: Some(quote.external_id.clone()),
+        ingest_run_id: run_id,
+    }
+}
+
 /// Applies rules 1, 2 and 3 to one quote.
 fn validate(
     game: &db::Game,
     target: &PollTarget,
-    quote: &crate::source::ParsedQuote,
+    quote: &ParsedQuote,
     started_at: DateTime<Utc>,
 ) -> Result<(i64, DateTime<Utc>), Rejection> {
     // Rule 1. A provider that re-points an existing identifier at a different

@@ -83,6 +83,35 @@ impl Rarity {
     }
 }
 
+/// The version every card has until a promotion gives it another.
+pub const BASE_VERSION: &str = "base";
+
+/// Folds a provider's version string into the canonical form.
+///
+/// Section 4.2 makes version a closed domain we own. The promotional list is
+/// open ended, so this constrains the shape rather than the values, and the
+/// database enforces the same shape.
+///
+/// It matters because the comparison is exact in three places: the polling tier,
+/// the coverage ranking and the valuation class key. A provider sending "Base"
+/// or " TOTS " instead of "base" and "tots" would silently re-tier and re-class
+/// every card it touched.
+pub fn canonical_version(raw: Option<String>) -> String {
+    let folded = raw
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_");
+
+    if folded.is_empty() {
+        BASE_VERSION.to_string()
+    } else {
+        folded
+    }
+}
+
 /// Assigns a polling interval from columns we already hold. A tier is a
 /// computable predicate, not an editorial judgement, so that discovery can
 /// create poll state without a human deciding anything.
@@ -91,7 +120,7 @@ impl Rarity {
 /// often. Low rated base cards move slowly and would waste the request budget.
 pub fn poll_interval_seconds(version: &str, rating: Option<i16>) -> i32 {
     let rating = rating.unwrap_or(0);
-    if version != "base" || rating >= 88 {
+    if version != BASE_VERSION || rating >= 88 {
         900
     } else if rating >= 83 {
         3_600
@@ -172,8 +201,7 @@ pub fn timestamp_in_range(
     game_released_at: DateTime<Utc>,
     run_started_at: DateTime<Utc>,
 ) -> bool {
-    observed_at >= game_released_at
-        && observed_at <= run_started_at + chrono::Duration::minutes(5)
+    observed_at >= game_released_at && observed_at <= run_started_at + chrono::Duration::minutes(5)
 }
 
 #[cfg(test)]
@@ -182,6 +210,25 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn a_version_folds_to_one_canonical_form() {
+        assert_eq!(canonical_version(Some("  TOTS ".into())), "tots");
+        assert_eq!(
+            canonical_version(Some("Winter Wildcards".into())),
+            "winter_wildcards"
+        );
+        assert_eq!(canonical_version(Some("Base".into())), BASE_VERSION);
+        assert_eq!(canonical_version(None), BASE_VERSION);
+        assert_eq!(canonical_version(Some("   ".into())), BASE_VERSION);
+    }
+
+    /// The whole point: a provider changing its casing must not re-tier a card.
+    #[test]
+    fn casing_from_a_provider_cannot_change_the_tier() {
+        let folded = canonical_version(Some("BASE".into()));
+        assert_eq!(poll_interval_seconds(&folded, Some(70)), 14_400);
     }
 
     #[test]
@@ -212,22 +259,38 @@ mod tests {
     fn rejects_a_timestamp_from_before_the_game_existed() {
         let released = ts("2025-09-26T00:00:00Z");
         let run = ts("2026-08-07T12:00:00Z");
-        assert!(!timestamp_in_range(ts("2024-01-01T00:00:00Z"), released, run));
+        assert!(!timestamp_in_range(
+            ts("2024-01-01T00:00:00Z"),
+            released,
+            run
+        ));
     }
 
     #[test]
     fn rejects_a_timestamp_far_in_the_future() {
         let released = ts("2025-09-26T00:00:00Z");
         let run = ts("2026-08-07T12:00:00Z");
-        assert!(!timestamp_in_range(ts("2087-01-01T00:00:00Z"), released, run));
+        assert!(!timestamp_in_range(
+            ts("2087-01-01T00:00:00Z"),
+            released,
+            run
+        ));
     }
 
     #[test]
     fn accepts_a_small_clock_skew_ahead_of_the_run() {
         let released = ts("2025-09-26T00:00:00Z");
         let run = ts("2026-08-07T12:00:00Z");
-        assert!(timestamp_in_range(ts("2026-08-07T12:03:00Z"), released, run));
-        assert!(!timestamp_in_range(ts("2026-08-07T12:07:00Z"), released, run));
+        assert!(timestamp_in_range(
+            ts("2026-08-07T12:03:00Z"),
+            released,
+            run
+        ));
+        assert!(!timestamp_in_range(
+            ts("2026-08-07T12:07:00Z"),
+            released,
+            run
+        ));
     }
 
     #[test]

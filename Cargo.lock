@@ -1104,10 +1104,10 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
- "tower-http",
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "url",
  "uuid",
  "zstd",
 ]
@@ -3216,7 +3216,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 
