@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { MarketNav } from "@/components/market-nav";
 import { notFound } from "next/navigation";
 import type { UTCTimestamp } from "lightweight-charts";
 import { PriceChart, type ChartPoint } from "@/components/price-chart";
@@ -19,13 +20,17 @@ export default async function AssetPage({
   const requested = (await searchParams).market;
   const market = markets.find((m) => m.id === requested) ?? markets[0];
 
+  // Both calls are guarded, not just the first. A bad id makes the API reject
+  // BOTH, and an uncaught rejection here replaced the 404 with Next's generic
+  // "application error" page.
   const [asset, prices] = await Promise.all([
     getAsset(id).catch(() => null),
-    getPrices(id, market.id),
+    getPrices(id, market.id).catch(() => null),
   ]);
   if (!asset) notFound();
 
-  const latest = prices.at(-1) ?? null;
+  const series = prices ?? [];
+  const latest = series.at(-1) ?? null;
 
   return (
     <div className="space-y-6">
@@ -40,21 +45,11 @@ export default async function AssetPage({
             {asset.position ? ` · ${asset.position}` : ""}
           </p>
         </div>
-        <nav className="flex gap-1.5">
-          {markets.map((m) => (
-            <Link
-              key={m.id}
-              href={`/assets/${id}?market=${m.id}`}
-              className={
-                m.id === market.id
-                  ? "rounded border border-neutral-600 bg-neutral-800 px-2.5 py-1 text-xs"
-                  : "rounded border border-neutral-800 px-2.5 py-1 text-xs text-neutral-400 hover:text-neutral-200"
-              }
-            >
-              {m.platform}
-            </Link>
-          ))}
-        </nav>
+        <MarketNav
+          markets={markets}
+          currentId={market.id}
+          hrefFor={(m) => `/assets/${id}?market=${m}`}
+        />
       </div>
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -70,11 +65,11 @@ export default async function AssetPage({
         </Card>
         <Card>
           <CardLabel>Recorded changes</CardLabel>
-          <CardValue>{prices.length}</CardValue>
+          <CardValue>{series.length}</CardValue>
         </Card>
       </div>
 
-      <PriceChart points={toSeries(prices)} />
+      <PriceChart points={toSeries(series)} />
 
       <p className="text-xs text-neutral-500">
         The ledger records changes only, so a flat stretch means the price held, not that
