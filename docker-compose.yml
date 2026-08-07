@@ -9,7 +9,9 @@ services:
       POSTGRES_PASSWORD: fcmarket
       POSTGRES_DB: fcmarket
     ports:
-      - "5434:5432"
+      # Loopback only. Compose publishes to 0.0.0.0 by default, and these
+      # credentials are in the repository.
+      - "127.0.0.1:5434:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
     healthcheck:
@@ -28,8 +30,8 @@ services:
       MINIO_ROOT_USER: fcmarket
       MINIO_ROOT_PASSWORD: fcmarketsecret
     ports:
-      - "9002:9000"
-      - "9003:9001"
+      - "127.0.0.1:9002:9000"
+      - "127.0.0.1:9003:9001"
     volumes:
       - objectstore-data:/data
     healthcheck:
@@ -75,7 +77,9 @@ services:
       # volume that compression needs room on.
       - db-data:/var/lib/postgresql/data:ro
     ports:
-      - "8090:8090"
+      # The API has no authentication. It must sit behind something that
+      # does before it faces a network.
+      - "127.0.0.1:8090:8090"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8090/health"]
       interval: 30s

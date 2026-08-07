@@ -60,6 +60,16 @@ automatically.
 
 ## Operating notes
 
+**The API has no authentication.** Every endpoint is readable by anyone who can
+reach the port. `docker-compose.yml` therefore publishes the API, the database
+and the object store on loopback only. Put something that authenticates in front
+of the API before it faces a network, and do not remove the `127.0.0.1` prefixes
+without doing so.
+
+**The object store credentials are required, not defaulted.** A deployment that
+misses one fails at start rather than quietly authenticating with the
+development values in `.env.example`.
+
 **`PG_DUMP_PATH` must be at least as new as the server.** The database image
 ships a matching `pg_dump`; a host binary is often a different version. Newer is
 fine, older is not.
