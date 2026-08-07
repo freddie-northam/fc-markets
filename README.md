@@ -17,14 +17,27 @@ first. It holds the schema, the ingestion rules and the accepted risks.
 
 Rust 1.90 or later, Node with pnpm, and Docker.
 
+The whole stack, the way it runs in production:
+
 ```sh
-docker compose up -d          # TimescaleDB on 5434, MinIO on 9002
+docker compose up -d --build   # TimescaleDB, MinIO, and the server
+curl localhost:8090/health
+
+cd apps/web && pnpm install && pnpm dev
+```
+
+The server container migrates and then serves, so it can never start against a
+schema that has not been brought forward. Every service sets
+`restart: unless-stopped`, because a host reboot must not end the ledger.
+
+To work on the server itself, run it on the host against the same containers:
+
+```sh
+docker compose up -d db objectstore
 cp .env.example .env
 cargo run -- migrate          # schema, then the game and its two markets
 cargo run -- ingest           # one pass: discover, learn, cover, price
 cargo run -- serve            # API on 8090, plus ingestion on an interval
-
-cd apps/web && pnpm install && pnpm dev
 ```
 
 Ports avoid the usual local collisions: 5434 for PostgreSQL, 9002 and 9003 for
