@@ -23,6 +23,7 @@ pub fn router(pool: PgPool, config: Config) -> Router {
     let state = AppState { pool, config };
     Router::new()
         .route("/health", get(health))
+        .route("/markets", get(list_markets))
         .route("/assets", get(list_assets))
         .route("/assets/{id}", get(get_asset))
         .route("/assets/{id}/prices", get(asset_prices))
@@ -73,6 +74,28 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
 }
 
 #[derive(Serialize, sqlx::FromRow)]
+struct Market {
+    id: Uuid,
+    platform: String,
+    game_code: String,
+}
+
+/// The frontend resolves a market here rather than holding a seeded identifier.
+/// A hardcoded UUID in the web application would break silently the first time a
+/// second game joined the rotation.
+async fn list_markets(State(s): State<AppState>) -> Result<Json<Vec<Market>>, ApiError> {
+    let rows = sqlx::query_as::<_, Market>(
+        "SELECT m.id, m.platform, g.code AS game_code
+           FROM markets m
+           JOIN games g ON g.id = m.game_id
+          ORDER BY g.code, m.platform",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    Ok(Json(rows))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
 struct Asset {
     id: Uuid,
     name: String,
@@ -109,6 +132,9 @@ async fn get_asset(
 struct Range {
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
+    /// Optional. A card trades independently on each platform, so a series that
+    /// mixes two markets is not a price history.
+    market: Option<Uuid>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -116,6 +142,10 @@ struct PricePoint {
     observed_at: DateTime<Utc>,
     price: i64,
     source: String,
+    /// Always returned. Without it a caller that omits the `market` filter
+    /// receives both platforms interleaved and cannot separate them, and a chart
+    /// drawn from that zigzags between two markets.
+    market_id: Uuid,
 }
 
 /// Bounded on purpose. Without a default range and a row cap, one request for an
@@ -130,16 +160,22 @@ async fn asset_prices(
     let from = range.from.unwrap_or(to - chrono::Duration::days(30));
 
     let rows = sqlx::query_as::<_, PricePoint>(
-        "SELECT observed_at, price, source
+        "SELECT observed_at, price, source, market_id
            FROM market_observations
-          WHERE asset_id = $1 AND observed_at >= $2 AND observed_at <= $3
-          ORDER BY observed_at
+          WHERE asset_id = $1
+            AND observed_at >= $2 AND observed_at <= $3
+            AND ($5::uuid IS NULL OR market_id = $5)
+          -- market_id and source break the tie. Without them two markets, or two
+          -- sources at one instant, come back in an arbitrary order and the same
+          -- request answers differently on different days.
+          ORDER BY observed_at, market_id, source
           LIMIT $4",
     )
     .bind(id)
     .bind(from)
     .bind(to)
     .bind(s.config.api_row_cap)
+    .bind(range.market)
     .fetch_all(&s.pool)
     .await?;
     Ok(Json(rows))

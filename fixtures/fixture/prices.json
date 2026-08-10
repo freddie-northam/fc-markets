@@ -1,0 +1,85 @@
+[
+  { "id": "505120", "name": "Zinedine Zidane",
+    "playstation": { "price": 1420000, "minPrice": 350000, "maxPrice": 15000000, "priceUpdate": "2026-08-05T09:00:00Z" },
+    "pc":          { "price": 1380000, "minPrice": 350000, "maxPrice": 15000000, "priceUpdate": "2026-08-05T09:00:00Z" } },
+
+  { "id": "231747", "name": "Kylian Mbappe",
+    "playstation": { "price": 486000, "minPrice": 120000, "maxPrice": 6000000, "priceUpdate": "2026-08-05T08:45:00Z" },
+    "pc":          { "price": 502000, "minPrice": 120000, "maxPrice": 6000000, "priceUpdate": "2026-08-05T08:45:00Z" } },
+
+  { "id": "239085", "name": "Erling Haaland",
+    "playstation": { "price": 214000, "minPrice": 60000, "maxPrice": 3000000, "priceUpdate": "2026-08-05T08:30:00Z" },
+    "pc":          { "price": 208000, "minPrice": 60000, "maxPrice": 3000000, "priceUpdate": "2026-08-05T08:30:00Z" } },
+
+  { "id": "192985", "name": "Kevin De Bruyne",
+    "playstation": { "price": 1875000, "minPrice": 400000, "maxPrice": 15000000, "priceUpdate": "2026-08-05T08:55:00Z" },
+    "pc":          { "price": 1790000, "minPrice": 400000, "maxPrice": 15000000, "priceUpdate": "2026-08-05T08:55:00Z" } },
+
+  { "id": "202126", "name": "Harry Kane",
+    "playstation": { "price": 940000, "minPrice": 250000, "maxPrice": 10000000, "priceUpdate": "2026-08-05T08:50:00Z" },
+    "pc":          { "price": 905000, "minPrice": 250000, "maxPrice": 10000000, "priceUpdate": "2026-08-05T08:50:00Z" } },
+
+  { "id": "20801", "name": "Cristiano Ronaldo",
+    "playstation": { "price": 62000, "minPrice": 15000, "maxPrice": 800000, "priceUpdate": "2026-08-05T07:40:00Z" },
+    "pc":          { "price": 59500, "minPrice": 15000, "maxPrice": 800000, "priceUpdate": "2026-08-05T07:40:00Z" } },
+
+  { "id": "158023", "name": "Lionel Messi",
+    "playstation": { "price": 88000, "minPrice": 20000, "maxPrice": 1000000, "priceUpdate": "2026-08-05T07:55:00Z" },
+    "pc":          { "price": 84000, "minPrice": 20000, "maxPrice": 1000000, "priceUpdate": "2026-08-05T07:55:00Z" } },
+
+  { "id": "212198", "name": "Bruno Fernandes",
+    "playstation": { "price": 15000, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:20:00Z" },
+    "pc":          { "price": 14200, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:20:00Z" } },
+
+  { "id": "209331", "name": "Mohamed Salah",
+    "playstation": { "price": 17000, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:25:00Z" },
+    "pc":          { "price": 16500, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:25:00Z" } },
+
+  { "id": "190871", "name": "Neymar Jr",
+    "playstation": { "price": 18000, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:30:00Z" },
+    "pc":          { "price": 17600, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:30:00Z" } },
+
+  { "id": "167495", "name": "Manuel Neuer",
+    "playstation": { "price": 19000, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:35:00Z" },
+    "pc":          { "price": 18800, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:35:00Z" } },
+
+  { "id": "200389", "name": "Jan Oblak",
+    "playstation": { "price": 21000, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:40:00Z" },
+    "pc":          { "price": 20400, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:40:00Z" } },
+
+  { "id": "201535", "name": "Marco Verratti",
+    "playstation": { "price": 9000, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:45:00Z" },
+    "pc":          { "price": 8700, "minPrice": 3000, "maxPrice": 200000, "priceUpdate": "2026-08-05T06:45:00Z" } },
+
+  { "id": "100001", "name": "Diego Rossi",
+    "playstation": { "price": 800, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:10:00Z" },
+    "pc":          { "price": 850, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:10:00Z" } },
+
+  { "id": "100002", "name": "Tomas Holub",
+    "playstation": { "price": 850, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:15:00Z" },
+    "pc":          { "price": 900, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:15:00Z" } },
+
+  { "id": "100003", "name": "Andre Silva",
+    "playstation": { "price": 900, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:20:00Z" },
+    "pc":          { "price": 950, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:20:00Z" } },
+
+  { "id": "100004", "name": "Kwame Mensah",
+    "playstation": { "price": 950, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:25:00Z" },
+    "pc":          { "price": 1000, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:25:00Z" } },
+
+  { "id": "100005", "name": "Luca Bianchi",
+    "playstation": { "price": 1000, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:30:00Z" },
+    "pc":          { "price": 1050, "minPrice": 200, "maxPrice": 10000, "priceUpdate": "2026-08-06T22:30:00Z" } },
+
+  { "id": "900001", "name": "Unpriced Reserve",
+    "playstation": { "price": null, "minPrice": 200, "maxPrice": 30000, "priceUpdate": "2026-08-06T20:00:00Z" },
+    "pc":          { "price": null, "minPrice": 200, "maxPrice": 30000, "priceUpdate": "2026-08-06T20:00:00Z" } },
+
+  { "id": "900002", "name": "Undated Reserve",
+    "playstation": { "price": 4200, "minPrice": 200, "maxPrice": 30000, "priceUpdate": null },
+    "pc":          { "price": 4100, "minPrice": 200, "maxPrice": 30000, "priceUpdate": null } },
+
+  { "id": "900003", "name": "Floored Reserve",
+    "playstation": { "price": 200, "minPrice": 200, "maxPrice": 30000, "priceUpdate": "2026-08-06T21:00:00Z" },
+    "pc":          { "price": 200, "minPrice": 200, "maxPrice": 30000, "priceUpdate": "2026-08-06T21:00:00Z" } }
+]
