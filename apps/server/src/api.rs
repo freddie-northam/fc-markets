@@ -127,7 +127,9 @@ async fn list_assets(State(s): State<AppState>) -> Result<Json<Vec<Asset>>, ApiE
     let rows = sqlx::query_as::<_, Asset>(
         "SELECT id, name, rating, rarity, version, position
            FROM assets
-          ORDER BY rating DESC NULLS LAST, name
+          -- id settles two cards that share a name and a rating, so the cap
+          -- always keeps the same ones.
+          ORDER BY rating DESC NULLS LAST, name, id
           LIMIT $1",
     )
     .bind(s.config.api_row_cap)

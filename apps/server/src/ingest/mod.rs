@@ -384,7 +384,7 @@ async fn ingest_batch(
     let targets =
         db::poll_targets_for(runner.pool, runner.source.name(), game.id, requested).await?;
 
-    let by_key = index_quotes(&quotes);
+    let (by_key, contradicted) = index_quotes(&quotes);
 
     let polled_at = Utc::now();
     let mut polls = Vec::with_capacity(targets.len());
@@ -452,6 +452,15 @@ async fn ingest_batch(
             tally.rejected += 1;
             log_rejection(tally, &quote.external_id, Rejection::UnknownAsset);
         }
+    }
+
+    // A pair the provider contradicted inside one payload. The surviving quote
+    // was already counted through its target; this counts the one it overwrote,
+    // so a provider talking to itself shows up instead of vanishing.
+    if contradicted > 0 {
+        tally.seen += contradicted;
+        tally.rejected += contradicted;
+        warn!(contradicted, "the payload stated one pair more than once");
     }
 
     let counts = db::write_polls(runner.pool, &polls, polled_at, run.id).await?;
@@ -569,7 +578,7 @@ async fn replay_batches(
         )
         .await?;
 
-        let by_key = index_quotes(&quotes);
+        let (by_key, _) = index_quotes(&quotes);
 
         let mut observations = Vec::new();
         for target in &targets {
@@ -617,16 +626,30 @@ async fn replay_batches(
     Ok(report)
 }
 
-/// Indexes quotes by the pair that identifies one market row.
+/// Indexes quotes by the pair that identifies one market row, and counts the
+/// pairs a later duplicate contradicted.
 ///
-/// A repeated pair inside one payload keeps the last quote. A provider that
-/// duplicates a record is stating the same thing twice, and the idempotency index
-/// settles it either way.
-fn index_quotes(quotes: &[ParsedQuote]) -> HashMap<(&str, Platform), &ParsedQuote> {
-    quotes
-        .iter()
-        .map(|q| ((q.external_id.as_str(), q.platform), q))
-        .collect()
+/// One pair twice with the SAME numbers is the provider stating one thing twice,
+/// and either copy will do. One pair twice with DIFFERENT numbers is the provider
+/// stating two things, which is the symptom rule 1 exists for: an identifier that
+/// no longer means one card.
+///
+/// The last quote wins either way, because writing both would leave two rows at
+/// one instant and the valuation's "latest" LATERAL would have to pick between
+/// them arbitrarily. The contradiction is counted rather than dropped in silence.
+fn index_quotes(quotes: &[ParsedQuote]) -> (HashMap<(&str, Platform), &ParsedQuote>, i32) {
+    let mut by_key = HashMap::with_capacity(quotes.len());
+    let mut contradicted = 0;
+
+    for quote in quotes {
+        let previous = by_key.insert((quote.external_id.as_str(), quote.platform), quote);
+        if let Some(previous) = previous
+            && (previous.price != quote.price || previous.observed_at != quote.observed_at)
+        {
+            contradicted += 1;
+        }
+    }
+    (by_key, contradicted)
 }
 
 /// Builds the canonical row from a validated quote.

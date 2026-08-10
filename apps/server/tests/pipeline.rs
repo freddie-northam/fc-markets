@@ -1421,3 +1421,41 @@ async fn the_most_overdue_assets_are_polled_first_when_the_budget_is_short() {
     );
     db.cleanup().await;
 }
+
+/// A payload that carries one pair twice with different numbers is telling us
+/// two things about one card, which is the symptom rule 1 exists for. One quote
+/// has to win so the valuation's "latest" stays settled, but the contradiction
+/// must not vanish with it.
+#[tokio::test]
+async fn a_payload_that_contradicts_itself_is_counted_not_silently_reduced() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+
+    // The same card and platform twice, at two different prices.
+    let mut card = Card::new("101", "Marco Verratti").recent(9_000, 3);
+    let contradiction = card.quotes[0].clone();
+    card.quotes.push(TestQuote {
+        price: Some(50_000),
+        ..contradiction
+    });
+    let source = TestSource::new(vec![card]);
+
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let seen: i64 = db
+        .count("SELECT records_seen::bigint FROM ingest_runs ORDER BY started_at DESC LIMIT 1")
+        .await;
+    let rejected: i64 = db
+        .count("SELECT records_rejected::bigint FROM ingest_runs ORDER BY started_at DESC LIMIT 1")
+        .await;
+
+    // Two markets asked about, plus the overwritten quote.
+    assert_eq!(seen, 3, "the contradicted quote must still be counted");
+    assert_eq!(rejected, 1, "and counted as rejected, not as a price");
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        2,
+        "one price per pair reaches the ledger, so latest stays settled"
+    );
+    db.cleanup().await;
+}

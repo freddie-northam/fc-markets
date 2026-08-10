@@ -73,7 +73,12 @@ JOIN assets a ON a.id = l.asset_id
 -- cards that carry the volume.
 LEFT JOIN buckets b
        ON b.rarity = a.rarity AND b.version = a.version AND b.rating = a.rating
-ORDER BY at_floor, value_ratio NULLS LAST
+-- name and id break the tie. Every thin class carries a null ratio, so those
+-- rows all tie with each other, and an ORDER BY that does not settle them lets
+-- the planner return them in any order it likes: the table reshuffles between
+-- page loads, and a row cap keeps an arbitrary subset. The same reasoning put
+-- the source tiebreak in the LATERAL above.
+ORDER BY at_floor, value_ratio NULLS LAST, a.name, a.id
 LIMIT $2
 "#;
 
