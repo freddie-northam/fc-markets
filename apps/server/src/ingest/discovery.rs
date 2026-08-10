@@ -12,9 +12,9 @@
 use super::{Budget, Fetched, Run, Runner, Tally, fetch_and_archive};
 use crate::archive::Kind;
 use crate::db;
-use crate::domain::poll_interval_seconds;
+use crate::domain::{names_match, poll_interval_seconds};
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Recorded in `ingest_runs.metadata` so the next run can tell how long ago each
 /// slow step last ran, without a table of its own.
@@ -145,6 +145,7 @@ pub(crate) async fn maybe_refresh_metadata(
     }
 
     let mut updated = 0;
+    let mut repointed = 0;
     // Only a step that got all the way through may mark itself done. The flag
     // suppresses the step for a whole cadence, so a run that stopped early on
     // budget or a rate limit would leave every remaining asset without
@@ -199,11 +200,30 @@ pub(crate) async fn maybe_refresh_metadata(
         };
 
         for attrs in parsed {
-            let Some(asset) =
+            let Some((asset, held_name)) =
                 db::asset_by_external_id(runner.pool, source, game.id, &attrs.external_id).await?
             else {
                 continue;
             };
+
+            // Rule 1, at the other door. The price path rejects a payload whose
+            // name disagrees with the resolved asset, because that is a provider
+            // re-pointing an identifier at a different card. This step writes
+            // that same name, from the same provider. Without the check a
+            // re-pointed identifier only had to survive until the next refresh to
+            // be adopted, and every later price for the new card would then match
+            // the renamed asset and land on the old card's history.
+            if !names_match(&attrs.name, &held_name) {
+                repointed += 1;
+                warn!(
+                    external_id = %attrs.external_id,
+                    held = %held_name,
+                    claimed = %attrs.name,
+                    "the provider now names a different card for this identifier"
+                );
+                continue;
+            }
+
             let interval = poll_interval_seconds(&attrs.version, attrs.rating);
             db::update_asset_attributes(runner.pool, asset, &attrs, interval).await?;
             updated += 1;
@@ -223,6 +243,14 @@ pub(crate) async fn maybe_refresh_metadata(
         1,
     )
     .await?;
+    // An identifier that now names a different card is the fault rule 1 exists
+    // for, so the run says so rather than logging quietly.
+    if repointed > 0 {
+        tally.degrade(format!(
+            "{repointed} identifiers now name a different card, so their attributes were not applied"
+        ));
+    }
+
     let finished = complete && outstanding.is_empty();
 
     if finished {

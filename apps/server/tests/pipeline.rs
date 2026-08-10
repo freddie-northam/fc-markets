@@ -118,7 +118,8 @@ async fn two_sources_map_to_one_internal_asset() {
         db::asset_by_external_id(&db.pool, "alpha", db.game().await.unwrap().id, "101")
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .0;
 
     // The second provider knows the same card by a different identifier. Mapping
     // it onto the existing asset is what keeps one price history per card.
@@ -687,7 +688,8 @@ async fn a_failure_between_the_writes_leaves_no_poll_row_without_its_observation
     let asset = db::asset_by_external_id(&db.pool, "test", game.id, "101")
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .0;
     let run = db::open_run(&db.pool, "test", "test/1").await.unwrap().0;
 
     let before = db.count("SELECT count(*) FROM market_observations").await;
@@ -1504,6 +1506,45 @@ async fn a_replay_that_would_write_nothing_refuses_to_delete_everything() {
         db.count("SELECT count(*) FROM market_observations").await,
         before,
         "and the ledger must be exactly as it was"
+    );
+    db.cleanup().await;
+}
+
+/// Rule 1 rejects a price payload whose name disagrees with the resolved asset,
+/// because that is a provider re-pointing an identifier at a different card. But
+/// the metadata step writes that same name, from the same provider, with no
+/// check. A re-pointed identifier only had to survive until the next refresh to
+/// be adopted, and then every later price for the new card would match the
+/// renamed asset and land on the old card's history.
+#[tokio::test]
+async fn the_metadata_step_cannot_be_used_to_defeat_the_identity_check() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 6)]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let before = db.count("SELECT count(*) FROM market_observations").await;
+    assert_eq!(before, 2);
+
+    // The provider now says identifier 101 is a different footballer, in the
+    // metadata AND in the prices, so the two agree with each other.
+    source.set_cards(vec![Card::new("101", "Erling Haaland").recent(250_000, 3)]);
+    make_everything_due(&db.pool).await.unwrap();
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let name: String = sqlx::query_scalar("SELECT name FROM assets LIMIT 1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        name, "Marco Verratti",
+        "the identity anchor must not be overwritten by the provider that is \
+         contradicting it"
+    );
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        before,
+        "and the other card's prices must not land on this card's history"
     );
     db.cleanup().await;
 }

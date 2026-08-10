@@ -695,22 +695,29 @@ pub async fn assets_needing_metadata(
     .await?)
 }
 
+/// Returns the asset AND the name we currently hold for it.
+///
+/// The name comes back because rule 1 has to be applied here too: the caller
+/// compares it against what the provider now claims before letting the provider
+/// rewrite it.
 pub async fn asset_by_external_id(
     pool: &PgPool,
     source: &str,
     game: GameId,
     external_id: &str,
-) -> Result<Option<AssetId>> {
-    let id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT asset_id FROM asset_source_ids
-          WHERE source = $1 AND game_id = $2 AND external_id = $3",
+) -> Result<Option<(AssetId, String)>> {
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT si.asset_id, a.name
+           FROM asset_source_ids si
+           JOIN assets a ON a.id = si.asset_id
+          WHERE si.source = $1 AND si.game_id = $2 AND si.external_id = $3",
     )
     .bind(source)
     .bind(game.0)
     .bind(external_id)
     .fetch_optional(pool)
     .await?;
-    Ok(id.map(AssetId))
+    Ok(row.map(|(id, name)| (AssetId(id), name)))
 }
 
 /// Writes the canonical attributes and re-tiers the asset.
