@@ -601,11 +601,18 @@ pub async fn most_valuable_assets(
         "SELECT id, version, rating
            FROM assets
           WHERE game_id = $1
-          ORDER BY (version <> 'base') DESC, rating DESC NULLS LAST, id
+          -- The base version is bound from BASE_VERSION, so this ranking and
+          -- the tier expression in domain.rs cannot come to disagree about which
+          -- version is the plain one. They stay two expressions on purpose: one
+          -- ranks six hundred rows, which belongs in SQL, and one assigns an
+          -- interval, which is unit tested in Rust. Only the value they share
+          -- needs a single definition.
+          ORDER BY (version <> $3) DESC, rating DESC NULLS LAST, id
           LIMIT $2",
     )
     .bind(game.0)
     .bind(limit)
+    .bind(crate::domain::BASE_VERSION)
     .fetch_all(pool)
     .await?;
 

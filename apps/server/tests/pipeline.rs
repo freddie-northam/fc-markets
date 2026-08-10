@@ -1548,3 +1548,66 @@ async fn the_metadata_step_cannot_be_used_to_defeat_the_identity_check() {
     );
     db.cleanup().await;
 }
+
+/// Every column of a fact table's unique index must also appear in its
+/// compression settings.
+///
+/// TimescaleDB cannot enforce uniqueness against a compressed chunk on a column
+/// it did not segment or order by. Get this wrong and the ledger keeps its only
+/// idempotency guarantee for thirty days and then quietly loses it, so a replay
+/// or a retry starts duplicating rows and nothing says so. It warns once, at
+/// migration time, into a log nobody reads twice.
+///
+/// This asserts the relationship rather than the current column list, so adding
+/// a column to either index without adding it to the compression settings fails
+/// here instead of in production a month later.
+#[tokio::test]
+async fn compression_covers_every_column_of_the_idempotency_indexes() {
+    let db = TestDb::new().await.unwrap();
+
+    let uncovered: Vec<(String, String, String)> = sqlx::query_as(
+        "WITH idx AS (
+             SELECT i.indrelid::regclass::text AS tbl,
+                    i.indexrelid::regclass::text AS idx,
+                    a.attname
+               FROM pg_index i
+               JOIN pg_attribute a
+                 ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+              WHERE i.indisunique
+                AND i.indrelid::regclass::text IN ('market_observations', 'ingest_polls')
+         ),
+         comp AS (
+             SELECT hypertable_name AS tbl, attname
+               FROM timescaledb_information.compression_settings
+         )
+         SELECT idx.tbl, idx.idx, idx.attname
+           FROM idx
+           LEFT JOIN comp ON comp.tbl = idx.tbl AND comp.attname = idx.attname
+          WHERE comp.attname IS NULL
+          ORDER BY 1, 3",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+
+    assert!(
+        uncovered.is_empty(),
+        "these unique-index columns are not in compress_segmentby or \
+         compress_orderby, so uniqueness stops being enforceable once the chunk \
+         compresses: {uncovered:?}"
+    );
+
+    // A guard that finds nothing because it looked at nothing is not a guard.
+    let checked: i64 = db
+        .count(
+            "SELECT count(*) FROM pg_index i
+              WHERE i.indisunique
+                AND i.indrelid::regclass::text IN ('market_observations', 'ingest_polls')",
+        )
+        .await;
+    assert_eq!(
+        checked, 2,
+        "both fact tables must have a unique index to check"
+    );
+    db.cleanup().await;
+}
