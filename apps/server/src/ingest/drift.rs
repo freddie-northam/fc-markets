@@ -38,7 +38,12 @@ const FROZEN_AFTER_HOURS: f64 = 24.0;
 const MAX_MEDIAN_MOVE: f64 = 3.0;
 
 /// Every check that fired. An empty result means the run looks healthy.
-pub async fn checks(pool: &PgPool, run_id: RunId, seen: i32, rejected_no_price: i32) -> Result<Vec<String>> {
+pub async fn checks(
+    pool: &PgPool,
+    run_id: RunId,
+    seen: i32,
+    rejected_no_price: i32,
+) -> Result<Vec<String>> {
     let mut failed = Vec::new();
 
     if seen > 0 {
@@ -90,9 +95,15 @@ pub async fn checks(pool: &PgPool, run_id: RunId, seen: i32, rejected_no_price: 
 /// aggregate: across every covered asset, nothing at all has moved for a day.
 async fn frozen_feed(pool: &PgPool) -> Result<Option<String>> {
     let newest: Option<f64> = sqlx::query_scalar(
+        // Bounded on polled_at, the partitioning column, so TimescaleDB excludes
+        // every chunk older than the window and never decompresses the archive to
+        // answer. The window is wider than the staleness the check is looking
+        // for, so the answer is the same; without it this scanned a table that
+        // grows for ever, on every run.
         "SELECT EXTRACT(EPOCH FROM (now() - max(source_observed_at)))::float8 / 3600.0
            FROM ingest_polls
-          WHERE source_observed_at IS NOT NULL",
+          WHERE source_observed_at IS NOT NULL
+            AND polled_at > now() - INTERVAL '3 days'",
     )
     .fetch_one(pool)
     .await?;
@@ -155,7 +166,7 @@ async fn distribution_shift(
         // Nothing to compare against yet. A first run is not a drift.
         return Ok(None);
     };
-    if ratio > MAX_MEDIAN_MOVE || ratio < 1.0 / MAX_MEDIAN_MOVE {
+    if !(1.0 / MAX_MEDIAN_MOVE..=MAX_MEDIAN_MOVE).contains(&ratio) {
         return Ok(Some(format!(
             "the median asset moved by a factor of {ratio:.2}, limit {MAX_MEDIAN_MOVE:.0}"
         )));

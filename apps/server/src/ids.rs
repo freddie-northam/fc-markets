@@ -7,7 +7,16 @@ use uuid::Uuid;
 macro_rules! typed_id {
     ($name:ident) => {
         #[derive(
-            Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            Hash,
+            PartialOrd,
+            Ord,
+            Serialize,
+            Deserialize,
             sqlx::Type,
         )]
         #[sqlx(transparent)]

@@ -131,11 +131,7 @@ async fn serve(pool: PgPool, config: Config) -> Result<()> {
         archive.clone(),
         config.clone(),
     ));
-    let backup_loop = tokio::spawn(backup_interval(
-        pool.clone(),
-        archive.clone(),
-        config.clone(),
-    ));
+    let backup_loop = tokio::spawn(backup_interval(archive.clone(), config.clone()));
 
     let app = api::router(pool, (*config).clone());
     let listener = tokio::net::TcpListener::bind(&config.bind_address).await?;
@@ -176,10 +172,19 @@ async fn ingest_interval(pool: PgPool, archive: Arc<S3Archive>, config: Arc<Conf
     }
 }
 
-async fn backup_interval(pool: PgPool, archive: Arc<S3Archive>, config: Arc<Config>) {
-    let mut ticker = tokio::time::interval(BACKUP_INTERVAL);
+/// `pg_dump` opens its own connection, so this task needs no pool.
+async fn backup_interval(archive: Arc<S3Archive>, config: Arc<Config>) {
+    // Starts one interval from now, NOT immediately. A tokio interval fires its
+    // first tick straight away, and with restart: unless-stopped a crash loop
+    // would then dump on every start: thirty restarts would push the whole
+    // thirty day history out through prune and leave thirty copies of one
+    // moment. The ingest loop wants its immediate first tick; this one must not
+    // have it.
+    let mut ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + BACKUP_INTERVAL,
+        BACKUP_INTERVAL,
+    );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let _ = &pool;
 
     loop {
         ticker.tick().await;

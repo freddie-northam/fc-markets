@@ -24,16 +24,20 @@ pub async fn run(
     keep: usize,
     at: DateTime<Utc>,
 ) -> Result<String> {
-    let output = tokio::process::Command::new(pg_dump_path)
+    let (connection, password) = split_password(database_url);
+    let mut command = tokio::process::Command::new(pg_dump_path);
+    command
         .arg("--format=custom")
         .arg("--no-owner")
         .arg("--no-acl")
-        .arg(database_url)
-        .output()
-        .await
-        .with_context(|| {
-            format!("could not run {pg_dump_path}; it must match the server's major version")
-        })?;
+        .arg(&connection);
+    if let Some(password) = password {
+        command.env("PGPASSWORD", password);
+    }
+
+    let output = command.output().await.with_context(|| {
+        format!("could not run {pg_dump_path}; it must match the server's major version")
+    })?;
 
     if !output.status.success() {
         anyhow::bail!(
@@ -59,6 +63,36 @@ pub async fn run(
     Ok(key)
 }
 
+/// Splits the password out of a connection URL.
+///
+/// An argument is visible to every user on the host through the process list, so
+/// the password must not travel that way. libpq reads it from `PGPASSWORD`, and
+/// the argument then carries everything else.
+///
+/// A URL we cannot parse is passed through untouched: failing the backup over a
+/// parse we do not understand would be worse than the exposure.
+fn split_password(database_url: &str) -> (String, Option<String>) {
+    let Ok(mut url) = url::Url::parse(database_url) else {
+        // libpq also accepts "host=... password=...", which parses as nothing
+        // here and would then travel on the argv this function exists to keep
+        // it off. Say so rather than silently reverting to the exposure.
+        if database_url.contains("password=") {
+            tracing::warn!(
+                "DATABASE_URL is in libpq keyword form, so the password cannot be moved out \
+                 of the pg_dump arguments; use a postgres:// URL to keep it off the process list"
+            );
+        }
+        return (database_url.to_string(), None);
+    };
+    let Some(password) = url.password().map(str::to_string) else {
+        return (database_url.to_string(), None);
+    };
+    if url.set_password(None).is_err() {
+        return (database_url.to_string(), None);
+    }
+    (url.to_string(), Some(password))
+}
+
 /// Keeps the newest `keep` dumps.
 ///
 /// The keys sort by time because they start with a zero padded UTC timestamp, so
@@ -80,4 +114,38 @@ async fn prune(archive: &S3Archive, keep: usize) -> Result<()> {
     }
     info!(removed = stale, "old dumps removed");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_password_leaves_the_connection_argument() {
+        let (connection, password) =
+            split_password("postgres://fcmarket:secret@localhost:5434/fcmarket");
+        assert!(
+            !connection.contains("secret"),
+            "the process list must not carry the password: {connection}"
+        );
+        assert!(connection.contains("localhost:5434"));
+        assert!(connection.ends_with("/fcmarket"));
+        assert_eq!(password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn a_url_with_no_password_is_unchanged() {
+        let (connection, password) = split_password("postgres://fcmarket@localhost/fcmarket");
+        assert_eq!(connection, "postgres://fcmarket@localhost/fcmarket");
+        assert_eq!(password, None);
+    }
+
+    /// Better to keep the exposure than to fail every backup over a form we did
+    /// not anticipate.
+    #[test]
+    fn an_unparseable_url_passes_through() {
+        let (connection, password) = split_password("not a url");
+        assert_eq!(connection, "not a url");
+        assert_eq!(password, None);
+    }
 }

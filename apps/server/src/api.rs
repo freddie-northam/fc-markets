@@ -50,10 +50,17 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
     let mut reasons = Vec::new();
 
     match db::newest_poll_age_seconds(&s.pool).await {
-        Err(e) => reasons.push(format!("cannot read poll history: {e}")),
+        Err(e) => {
+            // The detail goes to the operator, not into an unauthenticated body.
+            // ApiError already draws that line; this path was crossing it.
+            tracing::error!(error = %e, "cannot read the poll history");
+            reasons.push("the poll history cannot be read".to_string());
+        }
         Ok(None) => {} // Nothing polled yet. A fresh install is not a fault.
         Ok(Some(age)) => {
-            let limit = db::largest_poll_interval_seconds(&s.pool).await.unwrap_or(14_400);
+            let limit = db::largest_poll_interval_seconds(&s.pool)
+                .await
+                .unwrap_or(db::DEFAULT_POLL_INTERVAL_SECONDS);
             if age > f64::from(limit) {
                 reasons.push(format!("no poll for {age:.0}s, limit {limit}s"));
             }
@@ -65,11 +72,18 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
     {
         // Compression needs room for a compressed copy before it drops the
         // original, and a full volume stops PostgreSQL outright.
-        reasons.push(format!("free disk {free} below {}", s.config.min_free_disk_bytes));
+        reasons.push(format!(
+            "free disk {free} below {}",
+            s.config.min_free_disk_bytes
+        ));
     }
 
     let ok = reasons.is_empty();
-    let code = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let code = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (code, Json(Health { ok, reasons }))
 }
 
@@ -105,10 +119,18 @@ struct Asset {
     position: Option<String>,
 }
 
+/// Capped like every other list. Discovery records an `assets` row for the
+/// provider's whole catalogue, not just the covered few hundred, so without a
+/// bound this is the one endpoint that would serialise tens of thousands of rows
+/// on the host that also runs ingestion.
 async fn list_assets(State(s): State<AppState>) -> Result<Json<Vec<Asset>>, ApiError> {
     let rows = sqlx::query_as::<_, Asset>(
-        "SELECT id, name, rating, rarity, version, position FROM assets ORDER BY rating DESC NULLS LAST, name",
+        "SELECT id, name, rating, rarity, version, position
+           FROM assets
+          ORDER BY rating DESC NULLS LAST, name
+          LIMIT $1",
     )
+    .bind(s.config.api_row_cap)
     .fetch_all(&s.pool)
     .await?;
     Ok(Json(rows))
@@ -160,16 +182,24 @@ async fn asset_prices(
     let from = range.from.unwrap_or(to - chrono::Duration::days(30));
 
     let rows = sqlx::query_as::<_, PricePoint>(
-        "SELECT observed_at, price, source, market_id
-           FROM market_observations
-          WHERE asset_id = $1
-            AND observed_at >= $2 AND observed_at <= $3
-            AND ($5::uuid IS NULL OR market_id = $5)
-          -- market_id and source break the tie. Without them two markets, or two
-          -- sources at one instant, come back in an arbitrary order and the same
-          -- request answers differently on different days.
-          ORDER BY observed_at, market_id, source
-          LIMIT $4",
+        // The cap takes from the NEWEST end and the result is then re-sorted
+        // ascending. Capping an ascending scan keeps the oldest rows, so a range
+        // wider than the cap silently dropped the most recent prices, and the
+        // caller's "latest" became the price at the cap boundary.
+        //
+        // market_id and source break the tie. Without them two markets, or two
+        // sources at one instant, come back in an arbitrary order and the same
+        // request answers differently on different days.
+        "SELECT * FROM (
+            SELECT observed_at, price, source, market_id
+              FROM market_observations
+             WHERE asset_id = $1
+               AND observed_at >= $2 AND observed_at <= $3
+               AND ($5::uuid IS NULL OR market_id = $5)
+             ORDER BY observed_at DESC, market_id DESC, source DESC
+             LIMIT $4
+         ) recent
+         ORDER BY observed_at, market_id, source",
     )
     .bind(id)
     .bind(from)
@@ -213,7 +243,10 @@ impl axum::response::IntoResponse for ApiError {
             // The caller gets a readable sentence, the operator gets the detail.
             Self::Internal(detail) => {
                 tracing::error!(%detail, "request failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, "the server could not complete this request".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the server could not complete this request".to_string(),
+                )
             }
         };
         (code, Json(serde_json::json!({ "error": message }))).into_response()
@@ -221,38 +254,51 @@ impl axum::response::IntoResponse for ApiError {
 }
 
 /// Free bytes on the volume holding `path`, or None when the call fails.
+///
+/// The layout comes from `libc`, never from a struct declared here. `fsblkcnt_t`
+/// is 32 bits on macOS and 64 on Linux, so a hand written binding that assumes
+/// one width reads the wrong fields on the other platform and returns nonsense.
+/// It would do so silently, and this is the check that keeps compression from
+/// filling the volume and stopping PostgreSQL.
 fn free_disk_bytes(path: &str) -> Option<u64> {
     use std::ffi::CString;
+
     let c = CString::new(path).ok()?;
-    // SAFETY: statvfs only reads through the pointer, and buf is initialised by
-    // the call before we read it.
-    unsafe {
-        let mut buf: libc_statvfs = std::mem::zeroed();
-        if statvfs(c.as_ptr(), &mut buf) != 0 {
-            return None;
-        }
-        Some(buf.f_bavail.saturating_mul(buf.f_frsize))
+    let mut buf = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+
+    // SAFETY: `c` is a valid nul terminated path, and statvfs either fills `buf`
+    // completely or returns non-zero, which is the only case we read it in.
+    let failed = unsafe { libc::statvfs(c.as_ptr(), buf.as_mut_ptr()) } != 0;
+    if failed {
+        return None;
     }
+    let buf = unsafe { buf.assume_init() };
+    // `as` rather than `from`: these widths are platform dependent, so only a
+    // cast compiles everywhere, and widening never truncates. Whichever of the
+    // two is already u64 on the host makes its own cast redundant there, which
+    // is what the allow covers.
+    #[allow(clippy::unnecessary_cast)]
+    Some((buf.f_bavail as u64).saturating_mul(buf.f_frsize as u64))
 }
 
-#[repr(C)]
-#[allow(non_camel_case_types)]
-struct libc_statvfs {
-    f_bsize: u64,
-    f_frsize: u64,
-    f_blocks: u64,
-    f_bfree: u64,
-    f_bavail: u64,
-    f_files: u64,
-    f_ffree: u64,
-    f_favail: u64,
-    f_fsid: u64,
-    f_flag: u64,
-    f_namemax: u64,
-    f_spare: [u32; 6],
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-unsafe extern "C" {
-    #[link_name = "statvfs"]
-    fn statvfs(path: *const std::ffi::c_char, buf: *mut libc_statvfs) -> i32;
+    /// A plausibility check rather than an exact one: the number must be a real
+    /// figure for the volume, not the garbage a mismatched struct layout gives.
+    #[test]
+    fn free_disk_space_is_a_believable_figure() {
+        let free = free_disk_bytes(".").expect("statvfs must answer for the working directory");
+        assert!(free > 1024 * 1024, "an implausibly small figure: {free}");
+        assert!(
+            free < 1 << 50,
+            "an implausibly large figure, which is what a wrong layout gives: {free}"
+        );
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_returns_none() {
+        assert_eq!(free_disk_bytes("/no/such/path/here"), None);
+    }
 }
