@@ -7,8 +7,6 @@ use common::*;
 use fc_market::ids::{MarketId, Platform};
 use fc_market::valuation::{self, ClassValue};
 
-const PS: Platform = Platform::Playstation;
-
 /// A live asset: polled recently, with no failures, holding one price.
 async fn live_card(
     db: &TestDb,

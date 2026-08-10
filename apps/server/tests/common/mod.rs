@@ -16,9 +16,11 @@ use fc_market::config::Config;
 use fc_market::db;
 use fc_market::domain::{AssetAttributes, Rarity};
 use fc_market::ids::{GameId, MarketId, Platform};
+use fc_market::ingest::Runner;
 
-const PS_: Platform = Platform::Playstation;
-const PC_: Platform = Platform::Pc;
+/// The two platforms, defined once for every test file.
+pub const PS: Platform = Platform::Playstation;
+pub const PC: Platform = Platform::Pc;
 use fc_market::source::{FetchError, FetchResult, Listing, ParsedQuote, Source};
 use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
@@ -126,6 +128,22 @@ impl TestDb {
             .fetch_one(&self.pool)
             .await
             .expect("count query")
+    }
+}
+
+/// A runner over this database. Ten tests built this literal by hand, so a new
+/// field on `Runner` meant editing ten sites.
+pub fn runner_for<'a>(
+    db: &'a TestDb,
+    source: &'a TestSource,
+    archive: &'a dyn Archive,
+    config: &'a Config,
+) -> Runner<'a> {
+    Runner {
+        pool: &db.pool,
+        archive,
+        source,
+        config,
     }
 }
 
@@ -355,9 +373,9 @@ impl Card {
     pub fn recent(mut self, price: i64, hours: i64) -> Self {
         let at = hours_ago(hours);
         self.quotes
-            .push(TestQuote::new(PS_, Some(price), 200, Some(at)));
+            .push(TestQuote::new(PS, Some(price), 200, Some(at)));
         self.quotes
-            .push(TestQuote::new(PC_, Some(price * 97 / 100), 200, Some(at)));
+            .push(TestQuote::new(PC, Some(price * 97 / 100), 200, Some(at)));
         self
     }
 

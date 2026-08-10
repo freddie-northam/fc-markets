@@ -8,11 +8,8 @@ use fc_market::archive::Archive;
 use fc_market::config::Config;
 use fc_market::db;
 use fc_market::domain::{Observation, Poll, PollResult};
-use fc_market::ids::{AssetId, Platform, PollOutcome, RunStatus};
+use fc_market::ids::{AssetId, PollOutcome, RunStatus};
 use fc_market::ingest::{self, RunOutcome, Runner};
-
-const PS: Platform = Platform::Playstation;
-const PC: Platform = Platform::Pc;
 
 /// One poll cycle over the given source.
 async fn run_once(
@@ -169,12 +166,7 @@ async fn the_same_external_identifier_in_two_games_maps_to_two_assets() {
     let (next_game, _) = seed_second_game(&db.pool).await.unwrap();
     let mut config = db.config();
     config.game_code = "FC27".into();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     ingest::run(&runner).await.unwrap();
 
     assert_eq!(db.count("SELECT count(*) FROM assets").await, 2);
@@ -329,12 +321,7 @@ async fn coverage_follows_the_configured_budget() {
 
     let mut config = db.config();
     config.asset_coverage = 2;
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     ingest::run(&runner).await.unwrap();
 
     assert_eq!(db.count("SELECT count(*) FROM assets").await, 3);
@@ -883,12 +870,7 @@ async fn replaying_one_archive_twice_gives_the_same_table() {
     assert_eq!(original.len(), 3);
 
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     ingest::replay(&runner, run_id).await.unwrap();
     let once = snapshot(&db).await;
     ingest::replay(&runner, run_id).await.unwrap();
@@ -929,12 +911,7 @@ async fn replay_keeps_the_original_runs_verdict_on_a_timestamp() {
     age_runs(&db.pool, Duration::days(4)).await.unwrap();
 
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     ingest::replay(&runner, run_id).await.unwrap();
 
     assert_eq!(
@@ -965,12 +942,7 @@ async fn a_run_that_cannot_afford_a_single_request_does_not_close_ok() {
     config.metadata_cadence_seconds = 604_800;
     make_everything_due(&db.pool).await.unwrap();
 
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     let outcome = ingest::run(&runner).await.unwrap();
 
     assert_eq!(status(&outcome), RunStatus::Degraded);
@@ -998,12 +970,7 @@ async fn a_replay_that_cannot_read_its_archive_leaves_the_ledger_untouched() {
 
     // The object store has gone away between the run and the replay.
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &RefusingArchive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &RefusingArchive, &config);
     assert!(ingest::replay(&runner, run_id).await.is_err());
 
     assert_eq!(
@@ -1105,12 +1072,7 @@ async fn a_compressed_chunk_still_accepts_a_restatement_and_a_replay() {
 
     // And replay must still be able to delete out of one.
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     let report = ingest::replay(&runner, run_id).await.unwrap();
     assert!(
         report.deleted > 0,
@@ -1349,12 +1311,7 @@ async fn replay_refuses_a_run_written_by_a_different_source() {
         vec![Card::new("101", "Marco Verratti").recent(9_000, 3)],
     );
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &beta,
-        config: &config,
-    };
+    let runner = runner_for(&db, &beta, &archive, &config);
 
     let error = ingest::replay(&runner, run_id)
         .await
@@ -1405,12 +1362,7 @@ async fn a_metadata_step_that_stopped_early_does_not_mark_itself_done() {
         daily_request_budget: 3,
         ..db.config()
     }));
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config,
-    };
+    let runner = runner_for(&db, &source, &archive, config);
     ingest::run(&runner).await.unwrap();
 
     assert!(

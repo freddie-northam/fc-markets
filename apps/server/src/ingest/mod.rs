@@ -14,11 +14,12 @@ use crate::config::Config;
 use crate::db::{self, PollTarget};
 use crate::domain::{Observation, Poll, PollResult, Rejection, names_match, timestamp_in_range};
 use crate::ids::{Platform, PollOutcome, RunId, RunStatus};
-use crate::source::{FetchError, ParsedQuote, Source};
+use crate::source::{FetchError, FetchResult, ParsedQuote, Source};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use tracing::{info, warn};
 
 /// How many raw fragments a single run will log.
@@ -104,6 +105,84 @@ impl Budget {
     }
 }
 
+/// Names the step a rate limit would stop, and the unit that failed.
+///
+/// Both come from the payload kind, so a call site cannot label one thing and
+/// archive another.
+fn describe(kind: Kind, batch: usize) -> (&'static str, String) {
+    match kind {
+        // A rate limit on prices stops the whole run: there is nothing after it.
+        Kind::Prices => ("this run", format!("batch {batch}")),
+        Kind::AssetList => ("asset discovery", "the asset list".to_string()),
+        Kind::Metadata => ("the metadata step", format!("metadata batch {batch}")),
+    }
+}
+
+/// What a fetch attempt produced, and what the caller must do next.
+pub(crate) enum Fetched {
+    /// Stored, and safe to parse.
+    Ready(Envelope, String),
+    /// This unit failed. Move to the next.
+    Skip,
+    /// The provider refused. Stop asking.
+    Stop,
+}
+
+/// Fetches one payload and archives it before anything parses it.
+///
+/// The archive write is a precondition, and this is the only place that says so.
+/// A payload that was never stored cannot be re-parsed, so writing rows from one
+/// would quietly void the replay guarantee. Three steps fetch from a provider and
+/// each used to restate this; a fourth would have had to remember.
+///
+pub(crate) async fn fetch_and_archive(
+    runner: &Runner<'_>,
+    tally: &mut Tally,
+    run: Run,
+    kind: Kind,
+    batch: usize,
+    fetch: impl Future<Output = FetchResult>,
+) -> Fetched {
+    let (step, unit) = describe(kind, batch);
+    let envelope = match fetch.await {
+        Ok(envelope) => envelope,
+        Err(FetchError::RateLimited) => {
+            // Section 4.5: a rate limit stops the step. It is not a per-record
+            // rejection, and retrying inside the same run would spend a quota the
+            // provider has already said is gone.
+            tally.degrade(format!("the provider rate limited {step}"));
+            return Fetched::Stop;
+        }
+        Err(FetchError::Other(e)) => {
+            tally.degrade(format!("{unit} could not be fetched: {e}"));
+            return Fetched::Skip;
+        }
+    };
+
+    let key = object_key(
+        runner.source.name(),
+        kind,
+        &run.id.to_string(),
+        batch,
+        run.started_at,
+    );
+    if let Err(e) = runner.archive.put(&key, &envelope).await {
+        tally.degrade(format!(
+            "{unit} was not archived, so it was not parsed: {e}"
+        ));
+        return Fetched::Skip;
+    }
+    Fetched::Ready(envelope, key)
+}
+
+/// The run being written, carried together because rule 2 bounds every timestamp
+/// against the run's own start and every archive key is filed under it.
+#[derive(Clone, Copy)]
+pub(crate) struct Run {
+    pub(crate) id: RunId,
+    pub(crate) started_at: DateTime<Utc>,
+}
+
 pub struct Runner<'a> {
     pub pool: &'a PgPool,
     pub archive: &'a dyn Archive,
@@ -139,6 +218,10 @@ async fn run_locked(runner: &Runner<'_>) -> Result<RunOutcome> {
     let game = db::game_by_code(runner.pool, &runner.config.game_code).await?;
     let (run_id, started_at) =
         db::open_run(runner.pool, source_name, runner.source.parser_version()).await?;
+    let run = Run {
+        id: run_id,
+        started_at,
+    };
     info!(%run_id, source = source_name, "run opened");
 
     let spent_today = db::requests_spent_today(runner.pool, source_name).await?;
@@ -150,7 +233,7 @@ async fn run_locked(runner: &Runner<'_>) -> Result<RunOutcome> {
     };
 
     let mut tally = Tally::default();
-    let result = execute(runner, &game, run_id, started_at, &mut budget, &mut tally).await;
+    let result = execute(runner, &game, run, &mut budget, &mut tally).await;
 
     let error = match result {
         Ok(()) => None,
@@ -205,28 +288,26 @@ async fn run_locked(runner: &Runner<'_>) -> Result<RunOutcome> {
 async fn execute(
     runner: &Runner<'_>,
     game: &db::Game,
-    run_id: RunId,
-    started_at: DateTime<Utc>,
+    run: Run,
     budget: &mut Budget,
     tally: &mut Tally,
 ) -> Result<()> {
     // Discovery and metadata share the price budget, so they run first: an asset
     // that is not discovered is never polled, and one with no attributes has no
     // valuation input whatever its price history holds.
-    discovery::maybe_discover(runner, game, run_id, budget, tally).await?;
-    discovery::maybe_refresh_metadata(runner, game, run_id, budget, tally).await?;
+    discovery::maybe_discover(runner, game, run, budget, tally).await?;
+    discovery::maybe_refresh_metadata(runner, game, run, budget, tally).await?;
     // Coverage runs after the metadata step, so the tier expression reads the
     // ratings this run just learned rather than last week's.
     discovery::apply_coverage(runner, game).await?;
 
-    ingest_prices(runner, game, run_id, started_at, budget, tally).await
+    ingest_prices(runner, game, run, budget, tally).await
 }
 
 async fn ingest_prices(
     runner: &Runner<'_>,
     game: &db::Game,
-    run_id: RunId,
-    started_at: DateTime<Utc>,
+    run: Run,
     budget: &mut Budget,
     tally: &mut Tally,
 ) -> Result<()> {
@@ -255,50 +336,31 @@ async fn ingest_prices(
             tally.degrade("the daily request budget stopped this run");
             break;
         }
-        db::touch_heartbeat(runner.pool, run_id).await?;
+        db::touch_heartbeat(runner.pool, run.id).await?;
         tally.requests += 1;
-        db::record_request(runner.pool, run_id).await?;
+        db::record_request(runner.pool, run.id).await?;
 
-        let envelope = match runner.source.fetch_prices(chunk).await {
-            Ok(envelope) => envelope,
-            Err(FetchError::RateLimited) => {
-                // Section 4.5: this stops the run. It is not a per-record
-                // rejection, and retrying inside the same run would spend a quota
-                // the provider has already said is gone.
-                tally.degrade("the provider rate limited this run");
-                break;
-            }
-            Err(FetchError::Other(e)) => {
-                tally.degrade(format!("batch {batch} could not be fetched: {e}"));
-                continue;
-            }
-        };
-
-        // The archive write is a precondition. A payload that was never stored
-        // cannot be re-parsed, so writing observations from it would quietly void
-        // the replay guarantee.
-        let key = object_key(
-            runner.source.name(),
+        let (envelope, key) = match fetch_and_archive(
+            runner,
+            tally,
+            run,
             Kind::Prices,
-            &run_id.to_string(),
             batch,
-            started_at,
-        );
-        if let Err(e) = runner.archive.put(&key, &envelope).await {
-            tally.degrade(format!(
-                "batch {batch} was not archived, so it was not parsed: {e}"
-            ));
-            continue;
-        }
+            runner.source.fetch_prices(chunk),
+        )
+        .await
+        {
+            Fetched::Ready(envelope, key) => (envelope, key),
+            Fetched::Skip => continue,
+            Fetched::Stop => break,
+        };
         // Recorded now, not at close. A run killed after this point still has a
         // replayable archive; recorded only at close, its stored payloads would
         // be unreachable.
-        db::record_price_key(runner.pool, run_id, &key).await?;
+        db::record_price_key(runner.pool, run.id, &key).await?;
         tally.price_keys.push(key);
 
-        if let Err(e) =
-            ingest_batch(runner, game, run_id, started_at, chunk, &envelope, tally).await
-        {
+        if let Err(e) = ingest_batch(runner, game, run, chunk, &envelope, tally).await {
             tally.degrade(format!("batch {batch} could not be stored: {e}"));
         }
     }
@@ -313,8 +375,7 @@ async fn ingest_prices(
 async fn ingest_batch(
     runner: &Runner<'_>,
     game: &db::Game,
-    run_id: RunId,
-    started_at: DateTime<Utc>,
+    run: Run,
     requested: &[String],
     envelope: &Envelope,
     tally: &mut Tally,
@@ -338,7 +399,7 @@ async fn ingest_batch(
             None => (PollResult::Failed(PollOutcome::NoPrice), None),
             Some(quote) => {
                 let observed = quote.observed_at;
-                match validate(game, target, quote, started_at) {
+                match validate(game, target, quote, run.started_at) {
                     Ok((price, observed_at)) => (
                         PollResult::Priced(observation(
                             target,
@@ -346,7 +407,7 @@ async fn ingest_batch(
                             price,
                             observed_at,
                             runner.source.name(),
-                            run_id,
+                            run.id,
                         )),
                         observed,
                     ),
@@ -393,7 +454,7 @@ async fn ingest_batch(
         }
     }
 
-    let counts = db::write_polls(runner.pool, &polls, polled_at, run_id).await?;
+    let counts = db::write_polls(runner.pool, &polls, polled_at, run.id).await?;
     tally.written += counts.written as i32;
     tally.unchanged += counts.unchanged as i32;
 
