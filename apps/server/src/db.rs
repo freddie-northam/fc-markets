@@ -877,6 +877,23 @@ pub async fn replace_run_observations(
         }
     }
 
+    // A replay that resolves nothing must not be allowed to erase what it was
+    // meant to correct. This is the only path in the system that deletes ledger
+    // rows, and the two ways to reach it are ordinary: a parser change that
+    // rejects the whole payload, and an asset mapping that no longer resolves
+    // the identifiers the run recorded. Both would commit an empty rewrite and
+    // report success.
+    //
+    // Returning before the commit rolls the delete back. An operator who really
+    // does mean to drop a run's observations can do it deliberately; they should
+    // not get there by replaying.
+    if deleted > 0 && written == 0 {
+        anyhow::bail!(
+            "replay resolved nothing from run {original}, so it would delete {deleted} \
+             observations and write none; refusing to erase a history while correcting it"
+        );
+    }
+
     tx.commit().await?;
     Ok((deleted, written))
 }

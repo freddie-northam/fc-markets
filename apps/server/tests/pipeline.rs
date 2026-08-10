@@ -893,21 +893,25 @@ async fn replaying_one_archive_twice_gives_the_same_table() {
 async fn replay_keeps_the_original_runs_verdict_on_a_timestamp() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    // Priced two days ago, so the original run accepted it: its own start was
-    // later than that.
-    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 48)]);
+    // One card priced a week ago, one priced two days ago. The original run
+    // accepted both: its own start was later than either.
+    let source = TestSource::new(vec![
+        Card::new("101", "Long settled").recent(9_000, 168),
+        Card::new("102", "Recently moved").recent(12_000, 48),
+    ]);
     let outcome = run_once(&db, &source, &archive).await.unwrap();
     let RunOutcome::Completed { run_id, .. } = outcome else {
         panic!("the run must complete")
     };
     assert_eq!(
         db.count("SELECT count(*) FROM market_observations").await,
-        2
+        4
     );
 
-    // Move the recorded start back behind the quote. The wall clock has not
-    // moved, so the two bounds now disagree, and only one of them can be the one
-    // replay uses.
+    // Move the recorded start back between the two prices. The wall clock has
+    // not moved, so the two bounds now disagree: the recorded start rejects the
+    // two day old price and keeps the week old one, while a wall clock bound
+    // would keep both.
     age_runs(&db.pool, Duration::days(4)).await.unwrap();
 
     let config = db.config();
@@ -916,9 +920,18 @@ async fn replay_keeps_the_original_runs_verdict_on_a_timestamp() {
 
     assert_eq!(
         db.count("SELECT count(*) FROM market_observations").await,
-        0,
+        2,
         "replay must bound against the run's recorded start; a wall clock bound \
-         would have kept these rows and made one archive give two tables"
+         would have kept all four and made one archive give two tables"
+    );
+    assert_eq!(
+        db.count(
+            "SELECT count(*) FROM market_observations o JOIN assets a ON a.id = o.asset_id
+              WHERE a.name = 'Long settled'"
+        )
+        .await,
+        2,
+        "and it is the price inside the bound that survived"
     );
     db.cleanup().await;
 }
@@ -1456,6 +1469,41 @@ async fn a_payload_that_contradicts_itself_is_counted_not_silently_reduced() {
         db.count("SELECT count(*) FROM market_observations").await,
         2,
         "one price per pair reaches the ledger, so latest stays settled"
+    );
+    db.cleanup().await;
+}
+
+/// Replay is the only thing in the system that deletes from the ledger, and its
+/// whole purpose is to CORRECT it. A replay that resolves nothing must not be
+/// allowed to erase what it was meant to fix.
+#[tokio::test]
+async fn a_replay_that_would_write_nothing_refuses_to_delete_everything() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 3)]);
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+    let RunOutcome::Completed { run_id, .. } = outcome else {
+        panic!("the run must complete")
+    };
+    let before = db.count("SELECT count(*) FROM market_observations").await;
+    assert_eq!(before, 2);
+
+    // The parser now resolves nothing from the same archived payload. A changed
+    // provider shape or a re-seeded asset mapping both land here.
+    source.set_cards(vec![]);
+    let config = db.config();
+    let runner = runner_for(&db, &source, &archive, &config);
+
+    let result = ingest::replay(&runner, run_id).await;
+
+    assert!(
+        result.is_err(),
+        "replay must refuse to replace a history with nothing"
+    );
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        before,
+        "and the ledger must be exactly as it was"
     );
     db.cleanup().await;
 }
