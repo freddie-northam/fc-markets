@@ -186,6 +186,26 @@ pub fn names_match(payload: &str, resolved: &str) -> bool {
     fold_name(payload) == fold_name(resolved)
 }
 
+/// Rule 1, with the one exception the rule needs to stay useful: an asset we
+/// hold under no name has no identity to defend.
+///
+/// A provider lists an unreleased card with an empty name and fills the name in
+/// on release. Reading that as a re-point rejects the first real name the card
+/// ever has, and keeps rejecting it, because discovery retries every cadence.
+/// The asset then never gets attributes, sits in the slowest tier and the base
+/// valuation class for ever, and every run degrades with a re-point warning. The
+/// warning is how a REAL re-point would be noticed, so the false ones do not
+/// merely add noise, they hide the fault the rule exists to catch.
+///
+/// The exception is one directional. An empty payload name against a name we
+/// hold is still a mismatch: that erases identity rather than establishing it.
+pub fn name_is_consistent(payload: &str, resolved: &str) -> bool {
+    if fold_name(resolved).is_empty() {
+        return true;
+    }
+    names_match(payload, resolved)
+}
+
 fn fold_name(s: &str) -> String {
     let flattened: String = s
         .nfd()
@@ -365,6 +385,33 @@ mod tests {
     fn a_different_footballer_fails_the_identity_check() {
         assert!(!names_match("Kylian Mbappe", "Erling Haaland"));
         assert!(!names_match("Lionel Messi", "Lionel Scaloni"));
+    }
+
+    /// The provider lists an unreleased card with no name and fills it in on
+    /// release. That transition establishes identity rather than changing it, so
+    /// it must be adopted. Rejecting it strands the asset without attributes for
+    /// ever, because discovery retries the same comparison every cadence.
+    #[test]
+    fn a_first_real_name_is_adopted_over_a_name_we_never_had() {
+        assert!(name_is_consistent("Kylian Mbappe", ""));
+        assert!(name_is_consistent("Kylian Mbappe", "   "));
+    }
+
+    /// One directional. Blanking a name we hold erases identity, so it stays a
+    /// mismatch, and so does a genuine re-point.
+    #[test]
+    fn the_empty_name_exception_does_not_work_in_reverse() {
+        assert!(!name_is_consistent("", "Kylian Mbappe"));
+        assert!(!name_is_consistent("   ", "Kylian Mbappe"));
+        assert!(!name_is_consistent("Erling Haaland", "Kylian Mbappe"));
+    }
+
+    /// The exception must not weaken the rule where a name exists on both sides,
+    /// which is every case the rule was written for.
+    #[test]
+    fn the_exception_leaves_the_ordinary_comparison_alone() {
+        assert!(name_is_consistent("Kylian Mbappé", "Kylian Mbappe"));
+        assert!(!name_is_consistent("Lionel Messi", "Lionel Scaloni"));
     }
 
     /// The bound must follow the run, not the wall clock, or the same archive
