@@ -13,8 +13,9 @@ const INGEST_LOCK: i64 = 0x0000_FC1A_55E7;
 
 /// The interval assumed when no asset has one yet. It is the slowest tier, so a
 /// health check falling back to it waits the longest before crying outage. One
-/// definition, because the scheduler and the health check must agree on it.
-pub const DEFAULT_POLL_INTERVAL_SECONDS: i32 = 14_400;
+/// definition, because the scheduler and the health check must agree on it. It
+/// must stay equal to the slowest band of `poll_interval_seconds`.
+pub const DEFAULT_POLL_INTERVAL_SECONDS: i32 = 1_209_600;
 
 /// How long a run may go without a heartbeat before the next start declares it
 /// dead. A run that dies leaves its status at `running` for ever, which makes the
@@ -835,6 +836,27 @@ async fn link_player(
 // ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
+
+/// How many bytes this database holds on its volume.
+///
+/// It counts the database and the write ahead log, which are the two things
+/// that grow without bound. It cannot see anything else on the volume, so the
+/// figure is a floor and the caller takes it from a stated capacity.
+///
+/// This exists because a platform that gives each service its own volume stops
+/// the server from measuring the database's disk directly.
+pub async fn database_bytes(pool: &PgPool) -> Result<i64> {
+    let database: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())")
+        .fetch_one(pool)
+        .await?;
+    // pg_ls_waldir needs pg_monitor. A role without it still gets a useful
+    // number from the database size alone, so this must not fail the check.
+    let wal: i64 = sqlx::query_scalar("SELECT coalesce(sum(size), 0)::bigint FROM pg_ls_waldir()")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    Ok(database.saturating_add(wal))
+}
 
 /// Health reads the poll table, never the observation table. The observation
 /// table records changes only, so a quiet market writes nothing and would look

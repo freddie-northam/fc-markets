@@ -180,7 +180,9 @@ impl Source for FixtureSource {
         Ok(out)
     }
 
-    async fn fetch_asset_list(&self) -> FetchResult {
+    /// The whole list arrives in one file, so the page is ignored and
+    /// `next_asset_list_page` keeps its default of None.
+    async fn fetch_asset_list(&self, _page: u32) -> FetchResult {
         let body = self
             .read_json("assets.json")
             .await

@@ -290,10 +290,13 @@ async fn the_tier_expression_follows_the_rating_and_the_version() {
     .unwrap();
 
     let by_name: std::collections::HashMap<_, _> = intervals.into_iter().collect();
-    assert_eq!(by_name["Promo"], 900, "a promotional card is always tier A");
-    assert_eq!(by_name["Elite"], 900);
-    assert_eq!(by_name["Mid"], 3_600);
-    assert_eq!(by_name["Filler"], 14_400);
+    assert_eq!(
+        by_name["Promo"], 86_400,
+        "a promotional card never falls to a slow band"
+    );
+    assert_eq!(by_name["Elite"], 14_400);
+    assert_eq!(by_name["Mid"], 86_400);
+    assert_eq!(by_name["Filler"], 1_209_600);
     assert_eq!(
         db.count(
             "SELECT count(*) FROM (
@@ -1406,17 +1409,22 @@ async fn the_most_overdue_assets_are_polled_first_when_the_budget_is_short() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
     // Alphabetically ascending identifiers, so an alphabetical cap would take
-    // "aaa" first, which is the one polled most recently.
+    // "aaa" first, which is the one polled most recently. Both are rated into
+    // the 4 hour band, so both are genuinely due and the order is what decides.
     let source = TestSource::new(vec![
-        Card::new("aaa", "Freshly polled").recent(9_000, 3),
-        Card::new("bbb", "Waiting longest").recent(9_000, 3),
+        Card::new("aaa", "Freshly polled")
+            .rating(91)
+            .recent(9_000, 3),
+        Card::new("bbb", "Waiting longest")
+            .rating(91)
+            .recent(9_000, 3),
     ]);
     run_once(&db, &source, &archive).await.unwrap();
 
     let game = db.game().await.unwrap();
     sqlx::query(
         "UPDATE asset_poll_state s SET last_polled_at = CASE
-             WHEN si.external_id = 'aaa' THEN now() - INTERVAL '1 hour'
+             WHEN si.external_id = 'aaa' THEN now() - INTERVAL '5 hours'
              ELSE now() - INTERVAL '9 hours' END
            FROM asset_source_ids si
           WHERE si.asset_id = s.asset_id",

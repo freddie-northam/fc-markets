@@ -203,10 +203,15 @@ pub fn test_config() -> Config {
         object_store_bucket: String::new(),
         object_store_access_key: String::new(),
         object_store_secret_key: String::new(),
+        object_store_region: "us-east-1".into(),
+        object_store_path_style: true,
+        source_name: "fixture".into(),
+        source_base_url: String::new(),
         source_api_key: None,
         daily_request_budget: 1_000,
         http_timeout: std::time::Duration::from_secs(5),
         min_free_disk_bytes: 0,
+        database_volume_bytes: None,
         disk_check_path: ".".into(),
         heartbeat_url: None,
         api_row_cap: 5_000,
@@ -538,7 +543,7 @@ impl Source for TestSource {
         Ok(out)
     }
 
-    async fn fetch_asset_list(&self) -> FetchResult {
+    async fn fetch_asset_list(&self, _page: u32) -> FetchResult {
         if self.is_rate_limited() {
             return Err(FetchError::RateLimited);
         }

@@ -267,6 +267,50 @@ async fn a_fresh_install_with_no_polls_is_not_a_fault() {
     db.cleanup().await;
 }
 
+/// Section 4.9 on a platform that gives each service its own volume. The server
+/// cannot see the database's disk there, so the size comes from the database
+/// and is taken from the volume's stated capacity. A migrated database is
+/// several megabytes, so a capacity equal to the floor leaves less than the
+/// floor free.
+#[tokio::test]
+async fn a_full_database_volume_makes_health_return_503_without_reading_the_disk() {
+    let db = TestDb::new().await.unwrap();
+    let config = Config {
+        // Deliberately unreachable. Reaching it would prove the check still
+        // measured the filesystem, which is the defect this guards.
+        disk_check_path: "/nonexistent/not/a/path".into(),
+        database_volume_bytes: Some(8 * 1024 * 1024),
+        min_free_disk_bytes: 8 * 1024 * 1024,
+        ..db.config()
+    };
+    let server = Server::start(&db, config).await;
+    let response = server.get("/health").await;
+    assert_eq!(response.status(), 503, "a volume with no room is a fault");
+    assert!(
+        response.text().await.unwrap().contains("free disk"),
+        "the reason must name the disk, or an operator cannot act on it"
+    );
+    server.stop();
+    db.cleanup().await;
+}
+
+/// The same deployment with room left must stay healthy, or the check would be
+/// satisfied by any capacity at all and assert nothing.
+#[tokio::test]
+async fn a_database_volume_with_room_keeps_health_at_200() {
+    let db = TestDb::new().await.unwrap();
+    let config = Config {
+        disk_check_path: "/nonexistent/not/a/path".into(),
+        database_volume_bytes: Some(64 * 1024 * 1024 * 1024),
+        min_free_disk_bytes: 1024 * 1024 * 1024,
+        ..db.config()
+    };
+    let server = Server::start(&db, config).await;
+    assert_eq!(server.get("/health").await.status(), 200);
+    server.stop();
+    db.cleanup().await;
+}
+
 // ---------------------------------------------------------------------------
 // Heartbeat
 // ---------------------------------------------------------------------------

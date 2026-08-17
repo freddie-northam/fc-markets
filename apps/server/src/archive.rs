@@ -99,11 +99,17 @@ pub struct S3Archive {
 }
 
 impl S3Archive {
+    /// `path_style` and `region` differ by store and cannot be guessed. MinIO
+    /// serves paths and ignores the region. Other S3 compatible stores serve
+    /// virtual hosted buckets and state their own region, and sending the wrong
+    /// one fails at the first request rather than at configuration time.
     pub async fn connect(
         endpoint: &str,
         bucket: &str,
         access_key: &str,
         secret_key: &str,
+        region: &str,
+        path_style: bool,
     ) -> Result<Self> {
         let credentials = aws_sdk_s3::config::Credentials::new(
             access_key,
@@ -114,11 +120,10 @@ impl S3Archive {
         );
         let config = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .region(aws_sdk_s3::config::Region::new(region.to_string()))
             .endpoint_url(endpoint)
             .credentials_provider(credentials)
-            // MinIO serves paths, not virtual hosted buckets.
-            .force_path_style(true)
+            .force_path_style(path_style)
             .build();
 
         let archive = Self {
