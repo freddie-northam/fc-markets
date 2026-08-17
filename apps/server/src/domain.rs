@@ -112,32 +112,48 @@ pub fn canonical_version(raw: Option<String>) -> String {
     }
 }
 
+/// The fastest interval worth asking for.
+///
+/// Measured on 2026-08-17: the provider refreshes prices in one nightly window
+/// of roughly 05:00 to 07:00 UTC. Eleven of the most valuable Icons in the game
+/// all carried stamps inside a fifteen minute span and none had moved in the
+/// eleven hours after. `priceUpdate` marks when the price CHANGED, not when the
+/// provider last looked, so an illiquid card can sit unchanged for days.
+///
+/// Polling faster than this therefore buys nothing. It re-reads a number that
+/// cannot have moved, and spends a quota that could have covered another card.
+pub const UPSTREAM_REFRESH_SECONDS: i32 = 86_400;
+
 /// Assigns a polling interval from columns we already hold. A tier is a
 /// computable predicate, not an editorial judgement, so that discovery can
 /// create poll state without a human deciding anything.
 ///
-/// The bands come from a measured catalogue of 27,121 assets against a budget
-/// of 18,000 requests a day, where one request prices both platforms. They spend
-/// about 16,400 a day and leave the rest for discovery and retries. A faster top
-/// band does not fit: 1,193 assets at 4 hours already take 7,158 of it.
+/// With a daily upstream there is only one question left, and it is coverage
+/// rather than frequency: which cards can the budget afford EACH DAY. Against a
+/// measured catalogue of 27,121 and a budget of 18,000, where one request prices
+/// both platforms:
 ///
-/// An asset with no rating yet falls to the slowest band, so a catalogue that
+/// | band            | assets | interval | requests/day |
+/// |-----------------|--------|----------|--------------|
+/// | 75+ or promo    |  7,278 | 24h      |        7,278 |
+/// | below 75        | 19,798 | 72h      |        6,599 |
+/// | discovery walk  |      - | daily    |        1,357 |
+///
+/// That is about 15,200, leaving headroom for retries and failure backoff. The
+/// tail is the compromise: those cards mostly sit at their floor and rarely
+/// trade, so they lose resolution before anything else does.
+///
+/// An asset with no rating yet falls to the slower band, so a catalogue that
 /// arrives before its attributes cannot drain the budget.
 pub fn poll_interval_seconds(version: &str, rating: Option<i16>) -> i32 {
-    let by_rating = match rating.unwrap_or(0) {
-        r if r >= 90 => 14_400,
-        r if r >= 86 => 43_200,
-        r if r >= 83 => 86_400,
-        r if r >= 80 => 172_800,
-        r if r >= 75 => 604_800,
-        _ => 1_209_600,
-    };
-    // A promotional card is the traded end of the market, so it never falls to
-    // the slow bands whatever its rating.
-    if version == BASE_VERSION {
-        by_rating
+    // A promotion marks the traded end of the market, so it earns a daily read
+    // whatever its rating. Every promotional card measured was rated 80 or
+    // above, so today this changes nothing; it is here so that a low rated
+    // promotion does not quietly land in the tail.
+    if version != BASE_VERSION || rating.unwrap_or(0) >= 75 {
+        UPSTREAM_REFRESH_SECONDS
     } else {
-        by_rating.min(86_400)
+        3 * UPSTREAM_REFRESH_SECONDS
     }
 }
 
@@ -260,32 +276,46 @@ mod tests {
     #[test]
     fn casing_from_a_provider_cannot_change_the_tier() {
         let folded = canonical_version(Some("BASE".into()));
-        assert_eq!(poll_interval_seconds(&folded, Some(70)), 1_209_600);
+        assert_eq!(poll_interval_seconds(&folded, Some(70)), 259_200);
     }
 
+    /// Every promotional card measured was rated 80 or above, so this changes
+    /// nothing today. It is asserted so that a low rated promotion cannot
+    /// quietly land in the tail when one appears.
     #[test]
-    fn promotional_cards_never_fall_to_the_slow_bands() {
+    fn a_promotion_earns_a_daily_read_whatever_its_rating() {
         assert_eq!(poll_interval_seconds("tots", Some(70)), 86_400);
-        assert_eq!(poll_interval_seconds("icon", Some(81)), 86_400);
-        // A promotion does not slow a card that its rating already polls faster.
-        assert_eq!(poll_interval_seconds("tots", Some(91)), 14_400);
+        assert_eq!(poll_interval_seconds("icon", Some(50)), 86_400);
     }
 
     #[test]
-    fn base_cards_tier_by_rating() {
-        assert_eq!(poll_interval_seconds("base", Some(91)), 14_400);
-        assert_eq!(poll_interval_seconds("base", Some(87)), 43_200);
-        assert_eq!(poll_interval_seconds("base", Some(85)), 86_400);
-        assert_eq!(poll_interval_seconds("base", Some(81)), 172_800);
-        assert_eq!(poll_interval_seconds("base", Some(77)), 604_800);
-        assert_eq!(poll_interval_seconds("base", Some(72)), 1_209_600);
+    fn base_cards_split_at_seventy_five() {
+        assert_eq!(poll_interval_seconds("base", Some(91)), 86_400);
+        assert_eq!(poll_interval_seconds("base", Some(75)), 86_400);
+        assert_eq!(poll_interval_seconds("base", Some(74)), 259_200);
+        assert_eq!(poll_interval_seconds("base", Some(50)), 259_200);
     }
 
-    /// An asset discovered before its attributes must not take a fast band, or a
-    /// fresh catalogue would drain the budget on cards we cannot yet value.
+    /// Nothing polls faster than the provider refreshes. A shorter interval
+    /// re-reads a number that cannot have moved and spends a request that could
+    /// have covered another card.
+    #[test]
+    fn no_asset_polls_faster_than_the_provider_refreshes() {
+        for rating in 0..=99i16 {
+            for version in ["base", "tots", "icon", "team_of_the_season"] {
+                assert!(
+                    poll_interval_seconds(version, Some(rating)) >= UPSTREAM_REFRESH_SECONDS,
+                    "rating {rating} version {version} outruns the feed"
+                );
+            }
+        }
+    }
+
+    /// An asset discovered before its attributes must not take the daily band,
+    /// or a fresh catalogue would drain the budget on cards we cannot yet value.
     #[test]
     fn an_asset_without_a_rating_takes_the_slowest_band() {
-        assert_eq!(poll_interval_seconds("base", None), 1_209_600);
+        assert_eq!(poll_interval_seconds("base", None), 259_200);
     }
 
     #[test]
@@ -293,22 +323,16 @@ mod tests {
         for rating in 0..=99i16 {
             for version in ["base", "tots", "icon"] {
                 let secs = poll_interval_seconds(version, Some(rating));
-                assert!(
-                    matches!(
-                        secs,
-                        14_400 | 43_200 | 86_400 | 172_800 | 604_800 | 1_209_600
-                    ),
-                    "rating {rating}"
-                );
+                assert!(matches!(secs, 86_400 | 259_200), "rating {rating}");
             }
         }
     }
 
-    /// The bands must fit the budget. A change that spends more than a day's
-    /// requests fails here rather than in production a day later.
+    /// The bands must fit the budget, discovery included. A change that
+    /// overspends fails here rather than in production a day later.
     #[test]
     fn the_measured_catalogue_fits_the_daily_budget() {
-        // Measured on 2026-08-17 from a 500-player sample of 27,121 assets:
+        // Measured on 2026-08-17 across the full 27,121 asset catalogue:
         // (count, rating, version).
         let catalogue = [
             (1_193, 91, "icon"),
@@ -319,16 +343,21 @@ mod tests {
             (868, 77, "base"),
             (19_798, 65, "base"),
         ];
-        let daily: f64 = catalogue
+        let prices: f64 = catalogue
             .iter()
             .map(|(count, rating, version)| {
                 let interval = poll_interval_seconds(version, Some(*rating)) as f64;
                 *count as f64 * 86_400.0 / interval
             })
             .sum();
+        // The asset list walk spends the same budget: 27,121 assets at 20 to a
+        // page, once a day. Leaving it out is how a tier change looks affordable
+        // and then starves discovery.
+        let discovery = (27_121.0f64 / 20.0).ceil();
+        let daily = prices + discovery;
         assert!(
             daily <= 18_000.0,
-            "the tiers ask for {daily:.0} requests a day"
+            "prices {prices:.0} plus discovery {discovery:.0} is {daily:.0} a day"
         );
     }
 

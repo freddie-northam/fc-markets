@@ -292,11 +292,17 @@ async fn the_tier_expression_follows_the_rating_and_the_version() {
     let by_name: std::collections::HashMap<_, _> = intervals.into_iter().collect();
     assert_eq!(
         by_name["Promo"], 86_400,
-        "a promotional card never falls to a slow band"
+        "a promotional card earns a daily read whatever its rating"
     );
-    assert_eq!(by_name["Elite"], 14_400);
+    assert_eq!(
+        by_name["Elite"], 86_400,
+        "nothing outruns a feed that refreshes once a day"
+    );
     assert_eq!(by_name["Mid"], 86_400);
-    assert_eq!(by_name["Filler"], 1_209_600);
+    assert_eq!(
+        by_name["Filler"], 259_200,
+        "the tail loses resolution before anything else does"
+    );
     assert_eq!(
         db.count(
             "SELECT count(*) FROM (
@@ -1410,7 +1416,7 @@ async fn the_most_overdue_assets_are_polled_first_when_the_budget_is_short() {
     let archive = MemoryArchive::default();
     // Alphabetically ascending identifiers, so an alphabetical cap would take
     // "aaa" first, which is the one polled most recently. Both are rated into
-    // the 4 hour band, so both are genuinely due and the order is what decides.
+    // the daily band, so both are genuinely due and the order is what decides.
     let source = TestSource::new(vec![
         Card::new("aaa", "Freshly polled")
             .rating(91)
@@ -1424,8 +1430,8 @@ async fn the_most_overdue_assets_are_polled_first_when_the_budget_is_short() {
     let game = db.game().await.unwrap();
     sqlx::query(
         "UPDATE asset_poll_state s SET last_polled_at = CASE
-             WHEN si.external_id = 'aaa' THEN now() - INTERVAL '5 hours'
-             ELSE now() - INTERVAL '9 hours' END
+             WHEN si.external_id = 'aaa' THEN now() - INTERVAL '30 hours'
+             ELSE now() - INTERVAL '40 hours' END
            FROM asset_source_ids si
           WHERE si.asset_id = s.asset_id",
     )
