@@ -123,6 +123,8 @@ async fn connect_archive(config: &Config) -> Result<S3Archive> {
         &config.object_store_bucket,
         &config.object_store_access_key,
         &config.object_store_secret_key,
+        &config.object_store_region,
+        config.object_store_path_style,
     )
     .await
     .context("cannot reach the archive; ingestion will not start without it")

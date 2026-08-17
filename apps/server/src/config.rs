@@ -10,6 +10,11 @@ pub struct Config {
     pub object_store_bucket: String,
     pub object_store_access_key: String,
     pub object_store_secret_key: String,
+    /// The store's own region, and whether it serves paths or virtual hosted
+    /// buckets. MinIO wants path style and ignores the region; a hosted store
+    /// usually wants the opposite.
+    pub object_store_region: String,
+    pub object_store_path_style: bool,
     /// Which provider the run reads. `fixture` serves archived payloads from
     /// disk; `futdb` reads api.fut-db.com.
     pub source_name: String,
@@ -76,6 +81,8 @@ impl Config {
             object_store_bucket: req("OBJECT_STORE_BUCKET")?,
             object_store_access_key: req("OBJECT_STORE_ACCESS_KEY")?,
             object_store_secret_key: req("OBJECT_STORE_SECRET_KEY")?,
+            object_store_region: opt("OBJECT_STORE_REGION", "us-east-1"),
+            object_store_path_style: opt("OBJECT_STORE_PATH_STYLE", "true") != "false",
             source_name: opt("SOURCE", "fixture"),
             source_base_url: opt("SOURCE_BASE_URL", crate::ingest::futdb::DEFAULT_BASE_URL),
             source_api_key: std::env::var("SOURCE_API_KEY")

@@ -203,6 +203,8 @@ pub fn test_config() -> Config {
         object_store_bucket: String::new(),
         object_store_access_key: String::new(),
         object_store_secret_key: String::new(),
+        object_store_region: "us-east-1".into(),
+        object_store_path_style: true,
         source_name: "fixture".into(),
         source_base_url: String::new(),
         source_api_key: None,
