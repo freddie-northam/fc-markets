@@ -26,6 +26,11 @@ pub const DEFAULT_BASE_URL: &str = "https://api.fut-db.com";
 /// The rarity names that carry no promotional version.
 const BASE_RARITIES: [&str; 2] = ["common", "rare"];
 
+/// The version for a card whose rarity the provider did not state, or stated as
+/// an identifier absent from the vocabulary. Deliberately not `base`: see
+/// `version_for`. It satisfies the canonical shape the database enforces.
+const UNCLASSIFIED_VERSION: &str = "unclassified";
+
 #[derive(Debug, Deserialize)]
 struct PricesResponse {
     playstation: Option<Quote>,
@@ -204,14 +209,34 @@ impl FutdbSource {
         Ok(out)
     }
 
-    /// An unknown rarity becomes base. That understates a new promotional card
-    /// instead of mixing it into a promotional class.
+    /// A rarity we cannot name becomes its own version, never base.
+    ///
+    /// The provider ships some cards with no rarity at all, and they are not
+    /// obscure. The 98 rated Lampard is a FUTTIES card; the 98 rated Yamal is a
+    /// Phenoms card trading around a million coins. Both arrive as `rarity: null`,
+    /// so the promotion is real and only the label is missing. We cannot infer
+    /// which promotion from anything else in the payload, and guessing at base is
+    /// still a guess.
+    ///
+    /// Folding those into base was wrong in a way that is easy to miss. Base is
+    /// not a neutral bucket, it is a real class with real members: it keys the
+    /// valuation class median and the cohort bands, so an unclassified promo card
+    /// sitting in it compares a millions-of-coins FUTTIES card against ordinary
+    /// gold cards and drags that class for every card measured against it.
+    ///
+    /// Its own version is honest in both directions. The card stays visible, the
+    /// base class stays clean, and the polling tier reads any non-base version as
+    /// the traded end of the market and gives it a daily read, which is exactly
+    /// what a new promotional card deserves. When the provider fills the rarity
+    /// in, the metadata step moves the card to its proper version.
     fn version_for(&self, rarity: Option<i32>) -> String {
         match rarity.and_then(|id| self.rarities.get(&id)) {
-            Some(name) if !BASE_RARITIES.contains(&name.trim().to_lowercase().as_str()) => {
-                canonical_version(Some(name.clone()))
+            Some(name) if BASE_RARITIES.contains(&name.trim().to_lowercase().as_str()) => {
+                canonical_version(None)
             }
-            _ => canonical_version(None),
+            Some(name) => canonical_version(Some(name.clone())),
+            // Absent, or an identifier missing from the vocabulary we loaded.
+            None => UNCLASSIFIED_VERSION.to_string(),
         }
     }
 
@@ -551,12 +576,48 @@ mod tests {
         }
     }
 
+    /// Base is a real class with real members, not a neutral bucket. It keys the
+    /// valuation class median and the cohort bands, so an unclassified card put
+    /// there compares a millions-of-coins promo against ordinary golds.
     #[test]
-    fn an_unknown_rarity_falls_back_to_base() {
-        let attrs = source()
+    fn a_rarity_we_cannot_name_gets_its_own_version_not_base() {
+        let s = source();
+        // An identifier missing from the vocabulary.
+        let attrs = s
             .parse_asset_list_attributes(&list_envelope(list_body(1, 5, 9999)))
             .unwrap();
-        assert_eq!(attrs[0].version, canonical_version(None));
+        assert_eq!(attrs[0].version, "unclassified");
+        assert_ne!(attrs[0].version, canonical_version(None));
+    }
+
+    /// The 98 Lampard (FUTTIES) and the 98 Yamal (Phenoms, about a million coins)
+    /// both arrive as `rarity: null`. The promotion is real; only the label is
+    /// missing, so the version records the absence rather than guessing.
+    #[test]
+    fn a_card_with_no_rarity_at_all_is_unclassified() {
+        let mut body = list_body(1, 1, 0);
+        body["items"][0]["rarity"] = serde_json::Value::Null;
+        let attrs = source()
+            .parse_asset_list_attributes(&list_envelope(body))
+            .unwrap();
+        assert_eq!(attrs[0].version, "unclassified");
+    }
+
+    /// Unclassified must poll daily, because a card the provider has only just
+    /// added is the traded end of the market. The tier reads any non-base version
+    /// that way, so this asserts the two agree.
+    #[test]
+    fn an_unclassified_card_earns_a_daily_read() {
+        use crate::domain::{UPSTREAM_REFRESH_SECONDS, poll_interval_seconds};
+        assert_eq!(
+            poll_interval_seconds("unclassified", Some(98)),
+            UPSTREAM_REFRESH_SECONDS
+        );
+        assert_eq!(
+            poll_interval_seconds("unclassified", None),
+            UPSTREAM_REFRESH_SECONDS,
+            "even before we know its rating"
+        );
     }
 
     #[test]
