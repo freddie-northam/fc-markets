@@ -12,7 +12,7 @@
 use super::{Budget, Fetched, Run, Runner, Tally, fetch_and_archive};
 use crate::archive::Kind;
 use crate::db;
-use crate::domain::{AssetAttributes, names_match, poll_interval_seconds};
+use crate::domain::{AssetAttributes, name_is_consistent, poll_interval_seconds};
 use anyhow::Result;
 use tracing::{info, warn};
 
@@ -48,7 +48,7 @@ async fn apply_attributes(
         // re-pointed the identifier at a different card. Without this check the
         // rename only had to survive one refresh, after which every later price
         // for the new card landed on the old card's history.
-        if !names_match(&attrs.name, &held_name) {
+        if !name_is_consistent(&attrs.name, &held_name) {
             repointed += 1;
             warn!(
                 external_id = %attrs.external_id,

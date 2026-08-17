@@ -1518,6 +1518,58 @@ async fn a_replay_that_would_write_nothing_refuses_to_delete_everything() {
     db.cleanup().await;
 }
 
+/// The provider lists an unreleased card with no name and fills the name in on
+/// release. FUT-DB does this for thousands of assets, so the transition is
+/// routine rather than exceptional.
+///
+/// Read as a re-point it strands the asset for ever: attributes are never
+/// applied, so it keeps a null rating, the slowest tier and the base valuation
+/// class, and every run degrades with a re-point warning that would otherwise be
+/// how a real re-point is noticed.
+#[tokio::test]
+async fn a_card_that_gains_its_first_name_adopts_it_rather_than_being_rejected() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    // No name and no rating, which is exactly how the provider lists a card it
+    // has not released.
+    let source = TestSource::new(vec![Card::new("101", "").rating(0).recent(9_000, 6)]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let held: String = sqlx::query_scalar("SELECT name FROM assets LIMIT 1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(held, "", "the provider gave no name, so we hold none");
+
+    // EA releases the card and the provider names it.
+    source.set_cards(vec![
+        Card::new("101", "Kylian Mbappe")
+            .rating(91)
+            .recent(250_000, 3),
+    ]);
+    make_everything_due(&db.pool).await.unwrap();
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let (name, rating): (String, Option<i16>) =
+        sqlx::query_as("SELECT name, rating FROM assets LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(name, "Kylian Mbappe", "the first real name must be adopted");
+    assert_eq!(
+        rating,
+        Some(91),
+        "and its attributes with it, or the card is stuck in the slowest tier"
+    );
+
+    let reasons = degraded_reasons(&db).await;
+    assert!(
+        !reasons.iter().any(|r| r.contains("different card")),
+        "naming a card is not a re-point, so it must not degrade the run: {reasons:?}"
+    );
+    db.cleanup().await;
+}
+
 /// Rule 1 rejects a price payload whose name disagrees with the resolved asset,
 /// because that is a provider re-pointing an identifier at a different card. But
 /// the metadata step writes that same name, from the same provider, with no

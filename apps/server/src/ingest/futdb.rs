@@ -43,9 +43,16 @@ struct Quote {
     price_update: Option<DateTime<Utc>>,
 }
 
+/// The value the provider sends for a card it has never priced. It is .NET's
+/// `DateTime.MinValue`, so it means "never" and not a date. Parsed as a date it
+/// becomes year 1 AD, which rule 2 would then reject as out of range: the right
+/// outcome for the wrong reason, and only by luck, because rule 3 checks the
+/// price first and reports the accurate rejection.
+const NEVER: &str = "0001-01-01T00:00:00";
+
 /// The provider sends no zone, as `2026-08-17T12:40:34.58`. Local time would
-/// move every observation by the host offset. An unreadable value becomes None,
-/// which rule 3 then rejects.
+/// move every observation by the host offset. An absent, unreadable or sentinel
+/// value becomes None, which rule 3 then rejects.
 fn naive_utc<'de, D>(d: D) -> Result<Option<DateTime<Utc>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -53,6 +60,9 @@ where
     let Some(raw) = Option::<String>::deserialize(d)? else {
         return Ok(None);
     };
+    if raw.starts_with(NEVER) {
+        return Ok(None);
+    }
     if let Ok(zoned) = DateTime::parse_from_rfc3339(&raw) {
         return Ok(Some(zoned.with_timezone(&Utc)));
     }
@@ -467,6 +477,26 @@ mod tests {
             .unwrap();
         assert_eq!(quotes[0].observed_at, None);
         assert_eq!(quotes[0].price, Some(1));
+    }
+
+    /// The exact shape a never-priced card returns, copied from player 55682 on
+    /// 2026-08-17. The sentinel must not become a date: parsed, it is year 1 AD.
+    #[test]
+    fn the_never_priced_sentinel_is_read_as_no_timestamp() {
+        let body = serde_json::json!({
+            "playstation": { "id": 1, "price": null, "minPrice": null, "maxPrice": null,
+                "prp": null, "priceUpdate": "0001-01-01T00:00:00" },
+            "pc": null
+        });
+        let quotes = source()
+            .parse_prices(&price_envelope(vec!["55682".into()], body))
+            .unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].price, None);
+        assert_eq!(
+            quotes[0].observed_at, None,
+            "the sentinel means never, so it must not arrive as a year 1 date"
+        );
     }
 
     #[test]

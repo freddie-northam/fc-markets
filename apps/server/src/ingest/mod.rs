@@ -13,7 +13,9 @@ pub mod futdb;
 use crate::archive::{Archive, Envelope, Kind, object_key};
 use crate::config::Config;
 use crate::db::{self, PollTarget};
-use crate::domain::{Observation, Poll, PollResult, Rejection, names_match, timestamp_in_range};
+use crate::domain::{
+    Observation, Poll, PollResult, Rejection, name_is_consistent, timestamp_in_range,
+};
 use crate::ids::{Platform, PollOutcome, RunId, RunStatus};
 use crate::source::{FetchError, FetchResult, ParsedQuote, Source};
 use anyhow::{Context, Result};
@@ -691,7 +693,7 @@ fn validate(
     // and nothing would raise an error. We never compare the rating: cards raise
     // their rating in season by design.
     if let Some(name) = &quote.name
-        && !names_match(name, &target.name)
+        && !name_is_consistent(name, &target.name)
     {
         return Err(Rejection::IdentityMismatch);
     }
