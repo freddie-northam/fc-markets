@@ -837,6 +837,27 @@ async fn link_player(
 // Health
 // ---------------------------------------------------------------------------
 
+/// How many bytes this database holds on its volume.
+///
+/// It counts the database and the write ahead log, which are the two things
+/// that grow without bound. It cannot see anything else on the volume, so the
+/// figure is a floor and the caller takes it from a stated capacity.
+///
+/// This exists because a platform that gives each service its own volume stops
+/// the server from measuring the database's disk directly.
+pub async fn database_bytes(pool: &PgPool) -> Result<i64> {
+    let database: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())")
+        .fetch_one(pool)
+        .await?;
+    // pg_ls_waldir needs pg_monitor. A role without it still gets a useful
+    // number from the database size alone, so this must not fail the check.
+    let wal: i64 = sqlx::query_scalar("SELECT coalesce(sum(size), 0)::bigint FROM pg_ls_waldir()")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    Ok(database.saturating_add(wal))
+}
+
 /// Health reads the poll table, never the observation table. The observation
 /// table records changes only, so a quiet market writes nothing and would look
 /// exactly like an outage.

@@ -20,7 +20,16 @@ pub struct Config {
     pub daily_request_budget: u32,
     pub http_timeout: Duration,
     pub min_free_disk_bytes: u64,
-    /// Which filesystem the disk check measures.
+    /// The database volume's capacity, in bytes.
+    ///
+    /// Set this where the server cannot see the database's volume. A platform
+    /// that gives each service its own volume, as Railway does, stops `statvfs`
+    /// from reaching that disk, so the size is asked of the database instead and
+    /// taken from this figure. Leave it unset where the volume is shared, as
+    /// docker-compose mounts it, and the filesystem answers directly.
+    pub database_volume_bytes: Option<u64>,
+    /// Which filesystem the disk check measures. Ignored when
+    /// `database_volume_bytes` is set.
     ///
     /// Section 4.9 means the DATA volume: compression needs room for a
     /// compressed copy before it drops the original, and a full volume stops
@@ -75,6 +84,7 @@ impl Config {
             daily_request_budget: num("DAILY_REQUEST_BUDGET", 18_000)?,
             http_timeout: Duration::from_secs(num("HTTP_TIMEOUT_SECONDS", 30)?),
             min_free_disk_bytes: num("MIN_FREE_DISK_BYTES", 5 * 1024 * 1024 * 1024)?,
+            database_volume_bytes: opt_num("DATABASE_VOLUME_BYTES")?,
             disk_check_path: opt("DISK_CHECK_PATH", "."),
             heartbeat_url: std::env::var("HEARTBEAT_URL")
                 .ok()
@@ -99,6 +109,23 @@ fn req(key: &str) -> Result<String> {
 
 fn opt(key: &str, fallback: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| fallback.to_string())
+}
+
+/// An optional number. An empty value reads as unset, so a deployment can clear
+/// one by blanking it rather than by deleting the variable.
+fn opt_num<T: std::str::FromStr>(key: &str) -> Result<Option<T>>
+where
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(key) {
+        Err(_) => Ok(None),
+        Ok(raw) if raw.trim().is_empty() => Ok(None),
+        Ok(raw) => raw
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{key} is not a number: {e}")),
+    }
 }
 
 fn num<T: std::str::FromStr>(key: &str, fallback: T) -> Result<T>
