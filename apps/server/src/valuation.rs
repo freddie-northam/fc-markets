@@ -19,33 +19,16 @@ pub struct ClassValue {
 }
 
 /// The class median. Every clause below answers a specific way this can lie.
+/// The class median. Every clause below answers a specific way this can lie.
+///
+/// Which prices are trustworthy is NOT decided here. That lives in the
+/// `trusted_latest_prices` view, because the cohort index needs the same answer
+/// and two definitions of trust would drift apart in silence.
 pub const CLASS_MEDIAN_SQL: &str = r#"
-WITH live AS (
-    -- Freshness comes from the poll state, not from how old the price is. An
-    -- old observed_at is ambiguous: the price held, or we have failed to read
-    -- the card for weeks. Prices deflate, so a stale read is biased high and
-    -- would manufacture false buy signals.
-    SELECT asset_id
-    FROM asset_poll_state
+WITH latest AS (
+    SELECT asset_id, price, observed_at, min_price, at_floor
+    FROM trusted_latest_prices
     WHERE market_id = $1
-      AND consecutive_failures = 0
-      AND last_polled_at > now() - INTERVAL '3 days'
-),
-latest AS (
-    -- No time window on the observations. The table records changes only, so a
-    -- card that has held one price for months has no recent row, and a window
-    -- would drop the illiquid majority and bias every median upward.
-    SELECT v.asset_id, o.price, o.observed_at, o.min_price
-    FROM live v
-    CROSS JOIN LATERAL (
-        SELECT price, observed_at, min_price
-        FROM market_observations
-        WHERE market_id = $1 AND asset_id = v.asset_id
-        -- source breaks the tie. Without it two providers at one instant make
-        -- the same query return different answers on different days.
-        ORDER BY observed_at DESC, source
-        LIMIT 1
-    ) o
 ),
 buckets AS (
     SELECT a.rarity, a.version, a.rating,
@@ -53,9 +36,9 @@ buckets AS (
            count(*) AS n
     FROM latest l
     JOIN assets a ON a.id = l.asset_id
-    -- A card resting on EA's minimum listing price is not cheap, it is floored.
-    -- Leaving it in drags the median down for every card measured against it.
-    WHERE l.min_price IS NULL OR l.price > l.min_price
+    -- A floored card is not cheap. Leaving it in drags the median down for every
+    -- card measured against it.
+    WHERE NOT l.at_floor
     -- version carries the promotional variant and is the single most important
     -- column here. Without it a promo card and a base card of the same rating
     -- share a class, they trade orders of magnitude apart, and the ratio stops
@@ -65,7 +48,7 @@ buckets AS (
 SELECT a.id AS asset_id, a.name, l.price,
        b.median_price, b.n AS class_size,
        CASE WHEN b.n >= 5 THEN l.price::float8 / b.median_price END AS value_ratio,
-       (l.min_price IS NOT NULL AND l.price <= l.min_price) AS at_floor
+       l.at_floor
 FROM latest l
 JOIN assets a ON a.id = l.asset_id
 -- LEFT JOIN, not INNER. An inner join with a count threshold deletes the asset
@@ -76,8 +59,7 @@ LEFT JOIN buckets b
 -- name and id break the tie. Every thin class carries a null ratio, so those
 -- rows all tie with each other, and an ORDER BY that does not settle them lets
 -- the planner return them in any order it likes: the table reshuffles between
--- page loads, and a row cap keeps an arbitrary subset. The same reasoning put
--- the source tiebreak in the LATERAL above.
+-- page loads, and a row cap keeps an arbitrary subset.
 ORDER BY at_floor, value_ratio NULLS LAST, a.name, a.id
 LIMIT $2
 "#;

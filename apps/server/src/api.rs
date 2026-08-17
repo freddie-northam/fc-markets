@@ -1,3 +1,4 @@
+use crate::cohort;
 use crate::config::Config;
 use crate::db;
 use crate::ids::MarketId;
@@ -28,6 +29,7 @@ pub fn router(pool: PgPool, config: Config) -> Router {
         .route("/assets/{id}", get(get_asset))
         .route("/assets/{id}/prices", get(asset_prices))
         .route("/markets/{id}/valuations", get(valuations))
+        .route("/markets/{id}/cohorts", get(cohorts))
         .with_state(state)
 }
 
@@ -243,6 +245,15 @@ async fn valuations(
 ) -> Result<Json<Vec<valuation::ClassValue>>, ApiError> {
     let rows = valuation::class_median(&s.pool, MarketId(id), s.config.api_row_cap).await?;
     Ok(Json(rows))
+}
+
+/// No row cap. There are two versions times seven bands at most, so the result
+/// is bounded by the schema rather than by the catalogue.
+async fn cohorts(
+    State(s): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<cohort::CohortSnapshot>>, ApiError> {
+    Ok(Json(cohort::snapshot(&s.pool, MarketId(id)).await?))
 }
 
 pub enum ApiError {

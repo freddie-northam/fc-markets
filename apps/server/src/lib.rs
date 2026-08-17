@@ -7,6 +7,7 @@
 pub mod api;
 pub mod archive;
 pub mod backup;
+pub mod cohort;
 pub mod config;
 pub mod db;
 pub mod domain;
