@@ -98,27 +98,83 @@ fn split_password(database_url: &str) -> (String, Option<String>) {
 /// The keys sort by time because they start with a zero padded UTC timestamp, so
 /// a lexical sort is a chronological one.
 async fn prune(archive: &S3Archive, keep: usize) -> Result<()> {
-    let mut keys = archive.list(PREFIX).await?;
-    if keys.len() <= keep {
-        return Ok(());
-    }
-    keys.sort();
+    let stale = stale_keys(archive.list(PREFIX).await?, keep);
+    let removed = stale.len();
 
-    let stale = keys.len() - keep;
-    for key in keys.into_iter().take(stale) {
+    for key in stale {
         if let Err(e) = archive.delete(&key).await {
             // A dump that will not delete is a tidiness problem, never a reason
             // to fail the backup that just succeeded.
             warn!(key, error = %e, "could not remove an old dump");
         }
     }
-    info!(removed = stale, "old dumps removed");
+    info!(removed, "old dumps removed");
     Ok(())
+}
+
+/// The dumps to drop, oldest first.
+///
+/// Separated from the deleting so the choice can be tested. The I/O is a thin
+/// call; the risk lives here, in picking which files go, and an inverted sort
+/// would delete the newest dumps and leave the useless ones.
+///
+/// Keys sort chronologically because they start with a zero padded UTC
+/// timestamp, so a lexical sort is a chronological one.
+fn stale_keys(mut keys: Vec<String>, keep: usize) -> Vec<String> {
+    // At least one dump always survives. `keep` comes from configuration, and
+    // zero would otherwise delete the dump this run just took, so the command
+    // would report success having destroyed its own output.
+    let keep = keep.max(1);
+    if keys.len() <= keep {
+        return Vec::new();
+    }
+    keys.sort();
+    keys.truncate(keys.len() - keep);
+    keys
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dumps(names: &[&str]) -> Vec<String> {
+        names
+            .iter()
+            .map(|n| format!("backup/pg/{n}.dump"))
+            .collect()
+    }
+
+    #[test]
+    fn the_oldest_dumps_are_the_ones_dropped() {
+        // Deliberately out of order: the input is a bucket listing, not a sorted
+        // one, and the sort is what makes lexical order chronological.
+        let keys = dumps(&["20260103T000000Z", "20260101T000000Z", "20260102T000000Z"]);
+
+        assert_eq!(
+            stale_keys(keys, 2),
+            dumps(&["20260101T000000Z"]),
+            "the newest must survive and the oldest must go"
+        );
+    }
+
+    #[test]
+    fn nothing_is_dropped_while_the_history_is_short() {
+        let keys = dumps(&["20260101T000000Z", "20260102T000000Z"]);
+        assert!(stale_keys(keys.clone(), 2).is_empty());
+        assert!(stale_keys(keys, 30).is_empty());
+    }
+
+    /// A misconfigured keep of zero would otherwise delete the dump the run just
+    /// took, and the command would report success having destroyed its output.
+    #[test]
+    fn one_dump_always_survives_however_it_is_configured() {
+        let keys = dumps(&["20260101T000000Z", "20260102T000000Z"]);
+        assert_eq!(
+            stale_keys(keys, 0),
+            dumps(&["20260101T000000Z"]),
+            "keep zero must still leave the newest dump standing"
+        );
+    }
 
     #[test]
     fn the_password_leaves_the_connection_argument() {

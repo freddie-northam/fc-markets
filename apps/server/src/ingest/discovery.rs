@@ -9,14 +9,12 @@
 //! converges in a single pass: find the assets, learn what they are, then decide
 //! which of them the budget can afford to follow.
 
-use super::{Budget, Runner, Tally};
-use crate::archive::{Kind, object_key};
+use super::{Budget, Fetched, Run, Runner, Tally, fetch_and_archive};
+use crate::archive::Kind;
 use crate::db;
-use crate::domain::poll_interval_seconds;
-use crate::ids::RunId;
-use crate::source::FetchError;
+use crate::domain::{names_match, poll_interval_seconds};
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Recorded in `ingest_runs.metadata` so the next run can tell how long ago each
 /// slow step last ran, without a table of its own.
@@ -32,7 +30,7 @@ const METADATA_STEP: &str = "metadata_ran";
 pub(crate) async fn maybe_discover(
     runner: &Runner<'_>,
     game: &db::Game,
-    run_id: RunId,
+    run: Run,
     budget: &mut Budget,
     tally: &mut Tally,
 ) -> Result<()> {
@@ -52,36 +50,23 @@ pub(crate) async fn maybe_discover(
         return Ok(());
     }
     tally.requests += 1;
-    db::record_request(runner.pool, run_id).await?;
-    db::touch_heartbeat(runner.pool, run_id).await?;
+    db::record_request(runner.pool, run.id).await?;
+    db::touch_heartbeat(runner.pool, run.id).await?;
 
-    let envelope = match runner.source.fetch_asset_list().await {
-        Ok(envelope) => envelope,
-        Err(FetchError::RateLimited) => {
-            tally.degrade("the provider rate limited asset discovery");
-            return Ok(());
-        }
-        Err(FetchError::Other(e)) => {
-            tally.degrade(format!("the asset list could not be fetched: {e}"));
-            return Ok(());
-        }
-    };
-
-    // Archive before parse, exactly as for prices. The asset list is what decides
-    // which cards exist at all, so a change in it must stay auditable.
-    let key = object_key(
-        source,
+    // The asset list decides which cards exist at all, so a change in it must
+    // stay auditable. Same archive-before-parse rule as prices.
+    let Fetched::Ready(envelope, _) = fetch_and_archive(
+        runner,
+        tally,
+        run,
         Kind::AssetList,
-        &run_id.to_string(),
         0,
-        envelope.fetched_at,
-    );
-    if let Err(e) = runner.archive.put(&key, &envelope).await {
-        tally.degrade(format!(
-            "the asset list was not archived, so it was not parsed: {e}"
-        ));
+        runner.source.fetch_asset_list(),
+    )
+    .await
+    else {
         return Ok(());
-    }
+    };
 
     // A parse failure here degrades the run rather than ending it. The asset
     // list changing shape must not also stop us reading prices for the assets we
@@ -112,7 +97,7 @@ pub(crate) async fn maybe_discover(
     }
 
     tally.steps.push(DISCOVERY_STEP);
-    db::record_step(runner.pool, run_id, DISCOVERY_STEP).await?;
+    db::record_step(runner.pool, run.id, DISCOVERY_STEP).await?;
     info!(listed = listings.len(), added, "asset discovery finished");
     Ok(())
 }
@@ -125,7 +110,7 @@ pub(crate) async fn maybe_discover(
 pub(crate) async fn maybe_refresh_metadata(
     runner: &Runner<'_>,
     game: &db::Game,
-    run_id: RunId,
+    run: Run,
     budget: &mut Budget,
     tally: &mut Tally,
 ) -> Result<()> {
@@ -155,11 +140,12 @@ pub(crate) async fn maybe_refresh_metadata(
     if stale.is_empty() {
         // Nothing needs attributes, so the step is genuinely done.
         tally.steps.push(METADATA_STEP);
-        db::record_step(runner.pool, run_id, METADATA_STEP).await?;
+        db::record_step(runner.pool, run.id, METADATA_STEP).await?;
         return Ok(());
     }
 
     let mut updated = 0;
+    let mut repointed = 0;
     // Only a step that got all the way through may mark itself done. The flag
     // suppresses the step for a whole cadence, so a run that stopped early on
     // budget or a rate limit would leave every remaining asset without
@@ -173,42 +159,34 @@ pub(crate) async fn maybe_refresh_metadata(
             break;
         }
         tally.requests += 1;
-        db::record_request(runner.pool, run_id).await?;
+        db::record_request(runner.pool, run.id).await?;
         // The reaper only sees the heartbeat. A metadata refresh that walks the
         // catalogue can outlast ABANDON_AFTER before the price loop ever runs.
-        db::touch_heartbeat(runner.pool, run_id).await?;
-
-        let envelope = match runner.source.fetch_metadata(chunk).await {
-            Ok(envelope) => envelope,
-            Err(FetchError::RateLimited) => {
-                tally.degrade("the provider rate limited the metadata step");
-                complete = false;
-                break;
-            }
-            Err(FetchError::Other(e)) => {
-                tally.degrade(format!("metadata batch {batch} could not be fetched: {e}"));
-                complete = false;
-                continue;
-            }
-        };
+        db::touch_heartbeat(runner.pool, run.id).await?;
 
         // The archive wraps every provider response, including this one. Card
         // attributes feed every valuation input, so without them in the archive
         // they exist in one place only.
-        let key = object_key(
-            source,
+        let envelope = match fetch_and_archive(
+            runner,
+            tally,
+            run,
             Kind::Metadata,
-            &run_id.to_string(),
             batch,
-            envelope.fetched_at,
-        );
-        if let Err(e) = runner.archive.put(&key, &envelope).await {
-            tally.degrade(format!(
-                "metadata batch {batch} was not archived, so it was not parsed: {e}"
-            ));
-            complete = false;
-            continue;
-        }
+            runner.source.fetch_metadata(chunk),
+        )
+        .await
+        {
+            Fetched::Ready(envelope, _) => envelope,
+            Fetched::Skip => {
+                complete = false;
+                continue;
+            }
+            Fetched::Stop => {
+                complete = false;
+                break;
+            }
+        };
 
         // Same reasoning as the asset list: a metadata schema change must not
         // stop the price path, which is the part that cannot be caught up later.
@@ -222,11 +200,30 @@ pub(crate) async fn maybe_refresh_metadata(
         };
 
         for attrs in parsed {
-            let Some(asset) =
+            let Some((asset, held_name)) =
                 db::asset_by_external_id(runner.pool, source, game.id, &attrs.external_id).await?
             else {
                 continue;
             };
+
+            // Rule 1, at the other door. The price path rejects a payload whose
+            // name disagrees with the resolved asset, because that is a provider
+            // re-pointing an identifier at a different card. This step writes
+            // that same name, from the same provider. Without the check a
+            // re-pointed identifier only had to survive until the next refresh to
+            // be adopted, and every later price for the new card would then match
+            // the renamed asset and land on the old card's history.
+            if !names_match(&attrs.name, &held_name) {
+                repointed += 1;
+                warn!(
+                    external_id = %attrs.external_id,
+                    held = %held_name,
+                    claimed = %attrs.name,
+                    "the provider now names a different card for this identifier"
+                );
+                continue;
+            }
+
             let interval = poll_interval_seconds(&attrs.version, attrs.rating);
             db::update_asset_attributes(runner.pool, asset, &attrs, interval).await?;
             updated += 1;
@@ -246,11 +243,19 @@ pub(crate) async fn maybe_refresh_metadata(
         1,
     )
     .await?;
+    // An identifier that now names a different card is the fault rule 1 exists
+    // for, so the run says so rather than logging quietly.
+    if repointed > 0 {
+        tally.degrade(format!(
+            "{repointed} identifiers now name a different card, so their attributes were not applied"
+        ));
+    }
+
     let finished = complete && outstanding.is_empty();
 
     if finished {
         tally.steps.push(METADATA_STEP);
-        db::record_step(runner.pool, run_id, METADATA_STEP).await?;
+        db::record_step(runner.pool, run.id, METADATA_STEP).await?;
     }
     info!(updated, finished, "card attributes refreshed");
     Ok(())

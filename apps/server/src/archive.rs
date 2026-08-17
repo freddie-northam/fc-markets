@@ -218,42 +218,6 @@ impl Archive for S3Archive {
     }
 }
 
-/// Filesystem backed archive. Tests and offline replay use it. It writes the
-/// same bytes under the same keys as `S3Archive`.
-pub struct FileArchive {
-    root: std::path::PathBuf,
-}
-
-impl FileArchive {
-    pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-}
-
-#[async_trait]
-impl Archive for FileArchive {
-    async fn put(&self, key: &str, envelope: &Envelope) -> Result<()> {
-        let path = self.root.join(key);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-        tokio::fs::write(&path, encode(envelope)?)
-            .await
-            .with_context(|| format!("cannot write {}", path.display()))?;
-        Ok(())
-    }
-
-    async fn get(&self, key: &str) -> Result<Envelope> {
-        let path = self.root.join(key);
-        let bytes = tokio::fs::read(&path)
-            .await
-            .with_context(|| format!("cannot read {}", path.display()))?;
-        decode(&bytes)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,10 +228,11 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    #[tokio::test]
-    async fn a_written_envelope_reads_back_identically() {
-        let dir = std::env::temp_dir().join(format!("fcm-archive-{}", uuid::Uuid::now_v7()));
-        let archive = FileArchive::new(&dir);
+    /// The stored bytes must come back as the same envelope. `requested_ids` is
+    /// the field that matters most: when a response carries no player identifier
+    /// it is the only thing that can attribute the body on replay.
+    #[test]
+    fn an_encoded_envelope_decodes_back_identically() {
         let env = Envelope::new(
             "https://example.test/prices",
             vec!["101".into(), "102".into()],
@@ -276,14 +241,11 @@ mod tests {
             at(),
         );
 
-        let key = object_key("fixture", Kind::Prices, "run-1", 0, at());
-        archive.put(&key, &env).await.unwrap();
-        let back = archive.get(&key).await.unwrap();
+        let back = decode(&encode(&env).unwrap()).unwrap();
 
         assert_eq!(back.body, env.body);
         assert_eq!(back.requested_ids, vec!["101", "102"]);
         assert_eq!(back.sha256, env.sha256);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

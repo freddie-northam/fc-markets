@@ -8,11 +8,8 @@ use fc_market::archive::Archive;
 use fc_market::config::Config;
 use fc_market::db;
 use fc_market::domain::{Observation, Poll, PollResult};
-use fc_market::ids::{AssetId, Platform, PollOutcome, RunStatus};
+use fc_market::ids::{AssetId, PollOutcome, RunStatus};
 use fc_market::ingest::{self, RunOutcome, Runner};
-
-const PS: Platform = Platform::Playstation;
-const PC: Platform = Platform::Pc;
 
 /// One poll cycle over the given source.
 async fn run_once(
@@ -121,7 +118,8 @@ async fn two_sources_map_to_one_internal_asset() {
         db::asset_by_external_id(&db.pool, "alpha", db.game().await.unwrap().id, "101")
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .0;
 
     // The second provider knows the same card by a different identifier. Mapping
     // it onto the existing asset is what keeps one price history per card.
@@ -169,12 +167,7 @@ async fn the_same_external_identifier_in_two_games_maps_to_two_assets() {
     let (next_game, _) = seed_second_game(&db.pool).await.unwrap();
     let mut config = db.config();
     config.game_code = "FC27".into();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     ingest::run(&runner).await.unwrap();
 
     assert_eq!(db.count("SELECT count(*) FROM assets").await, 2);
@@ -329,12 +322,7 @@ async fn coverage_follows_the_configured_budget() {
 
     let mut config = db.config();
     config.asset_coverage = 2;
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     ingest::run(&runner).await.unwrap();
 
     assert_eq!(db.count("SELECT count(*) FROM assets").await, 3);
@@ -700,7 +688,8 @@ async fn a_failure_between_the_writes_leaves_no_poll_row_without_its_observation
     let asset = db::asset_by_external_id(&db.pool, "test", game.id, "101")
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .0;
     let run = db::open_run(&db.pool, "test", "test/1").await.unwrap().0;
 
     let before = db.count("SELECT count(*) FROM market_observations").await;
@@ -883,12 +872,7 @@ async fn replaying_one_archive_twice_gives_the_same_table() {
     assert_eq!(original.len(), 3);
 
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     ingest::replay(&runner, run_id).await.unwrap();
     let once = snapshot(&db).await;
     ingest::replay(&runner, run_id).await.unwrap();
@@ -911,37 +895,45 @@ async fn replaying_one_archive_twice_gives_the_same_table() {
 async fn replay_keeps_the_original_runs_verdict_on_a_timestamp() {
     let db = TestDb::new().await.unwrap();
     let archive = MemoryArchive::default();
-    // Priced two days ago, so the original run accepted it: its own start was
-    // later than that.
-    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 48)]);
+    // One card priced a week ago, one priced two days ago. The original run
+    // accepted both: its own start was later than either.
+    let source = TestSource::new(vec![
+        Card::new("101", "Long settled").recent(9_000, 168),
+        Card::new("102", "Recently moved").recent(12_000, 48),
+    ]);
     let outcome = run_once(&db, &source, &archive).await.unwrap();
     let RunOutcome::Completed { run_id, .. } = outcome else {
         panic!("the run must complete")
     };
     assert_eq!(
         db.count("SELECT count(*) FROM market_observations").await,
-        2
+        4
     );
 
-    // Move the recorded start back behind the quote. The wall clock has not
-    // moved, so the two bounds now disagree, and only one of them can be the one
-    // replay uses.
+    // Move the recorded start back between the two prices. The wall clock has
+    // not moved, so the two bounds now disagree: the recorded start rejects the
+    // two day old price and keeps the week old one, while a wall clock bound
+    // would keep both.
     age_runs(&db.pool, Duration::days(4)).await.unwrap();
 
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     ingest::replay(&runner, run_id).await.unwrap();
 
     assert_eq!(
         db.count("SELECT count(*) FROM market_observations").await,
-        0,
+        2,
         "replay must bound against the run's recorded start; a wall clock bound \
-         would have kept these rows and made one archive give two tables"
+         would have kept all four and made one archive give two tables"
+    );
+    assert_eq!(
+        db.count(
+            "SELECT count(*) FROM market_observations o JOIN assets a ON a.id = o.asset_id
+              WHERE a.name = 'Long settled'"
+        )
+        .await,
+        2,
+        "and it is the price inside the bound that survived"
     );
     db.cleanup().await;
 }
@@ -965,12 +957,7 @@ async fn a_run_that_cannot_afford_a_single_request_does_not_close_ok() {
     config.metadata_cadence_seconds = 604_800;
     make_everything_due(&db.pool).await.unwrap();
 
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     let outcome = ingest::run(&runner).await.unwrap();
 
     assert_eq!(status(&outcome), RunStatus::Degraded);
@@ -998,12 +985,7 @@ async fn a_replay_that_cannot_read_its_archive_leaves_the_ledger_untouched() {
 
     // The object store has gone away between the run and the replay.
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &RefusingArchive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &RefusingArchive, &config);
     assert!(ingest::replay(&runner, run_id).await.is_err());
 
     assert_eq!(
@@ -1105,12 +1087,7 @@ async fn a_compressed_chunk_still_accepts_a_restatement_and_a_replay() {
 
     // And replay must still be able to delete out of one.
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config: &config,
-    };
+    let runner = runner_for(&db, &source, &archive, &config);
     let report = ingest::replay(&runner, run_id).await.unwrap();
     assert!(
         report.deleted > 0,
@@ -1349,12 +1326,7 @@ async fn replay_refuses_a_run_written_by_a_different_source() {
         vec![Card::new("101", "Marco Verratti").recent(9_000, 3)],
     );
     let config = db.config();
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &beta,
-        config: &config,
-    };
+    let runner = runner_for(&db, &beta, &archive, &config);
 
     let error = ingest::replay(&runner, run_id)
         .await
@@ -1405,12 +1377,7 @@ async fn a_metadata_step_that_stopped_early_does_not_mark_itself_done() {
         daily_request_budget: 3,
         ..db.config()
     }));
-    let runner = Runner {
-        pool: &db.pool,
-        archive: &archive,
-        source: &source,
-        config,
-    };
+    let runner = runner_for(&db, &source, &archive, config);
     ingest::run(&runner).await.unwrap();
 
     assert!(
@@ -1466,6 +1433,181 @@ async fn the_most_overdue_assets_are_polled_first_when_the_budget_is_short() {
         due,
         vec!["bbb".to_string()],
         "the single affordable slot must go to the asset waiting longest"
+    );
+    db.cleanup().await;
+}
+
+/// A payload that carries one pair twice with different numbers is telling us
+/// two things about one card, which is the symptom rule 1 exists for. One quote
+/// has to win so the valuation's "latest" stays settled, but the contradiction
+/// must not vanish with it.
+#[tokio::test]
+async fn a_payload_that_contradicts_itself_is_counted_not_silently_reduced() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+
+    // The same card and platform twice, at two different prices.
+    let mut card = Card::new("101", "Marco Verratti").recent(9_000, 3);
+    let contradiction = card.quotes[0].clone();
+    card.quotes.push(TestQuote {
+        price: Some(50_000),
+        ..contradiction
+    });
+    let source = TestSource::new(vec![card]);
+
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let seen: i64 = db
+        .count("SELECT records_seen::bigint FROM ingest_runs ORDER BY started_at DESC LIMIT 1")
+        .await;
+    let rejected: i64 = db
+        .count("SELECT records_rejected::bigint FROM ingest_runs ORDER BY started_at DESC LIMIT 1")
+        .await;
+
+    // Two markets asked about, plus the overwritten quote.
+    assert_eq!(seen, 3, "the contradicted quote must still be counted");
+    assert_eq!(rejected, 1, "and counted as rejected, not as a price");
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        2,
+        "one price per pair reaches the ledger, so latest stays settled"
+    );
+    db.cleanup().await;
+}
+
+/// Replay is the only thing in the system that deletes from the ledger, and its
+/// whole purpose is to CORRECT it. A replay that resolves nothing must not be
+/// allowed to erase what it was meant to fix.
+#[tokio::test]
+async fn a_replay_that_would_write_nothing_refuses_to_delete_everything() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 3)]);
+    let outcome = run_once(&db, &source, &archive).await.unwrap();
+    let RunOutcome::Completed { run_id, .. } = outcome else {
+        panic!("the run must complete")
+    };
+    let before = db.count("SELECT count(*) FROM market_observations").await;
+    assert_eq!(before, 2);
+
+    // The parser now resolves nothing from the same archived payload. A changed
+    // provider shape or a re-seeded asset mapping both land here.
+    source.set_cards(vec![]);
+    let config = db.config();
+    let runner = runner_for(&db, &source, &archive, &config);
+
+    let result = ingest::replay(&runner, run_id).await;
+
+    assert!(
+        result.is_err(),
+        "replay must refuse to replace a history with nothing"
+    );
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        before,
+        "and the ledger must be exactly as it was"
+    );
+    db.cleanup().await;
+}
+
+/// Rule 1 rejects a price payload whose name disagrees with the resolved asset,
+/// because that is a provider re-pointing an identifier at a different card. But
+/// the metadata step writes that same name, from the same provider, with no
+/// check. A re-pointed identifier only had to survive until the next refresh to
+/// be adopted, and then every later price for the new card would match the
+/// renamed asset and land on the old card's history.
+#[tokio::test]
+async fn the_metadata_step_cannot_be_used_to_defeat_the_identity_check() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 6)]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let before = db.count("SELECT count(*) FROM market_observations").await;
+    assert_eq!(before, 2);
+
+    // The provider now says identifier 101 is a different footballer, in the
+    // metadata AND in the prices, so the two agree with each other.
+    source.set_cards(vec![Card::new("101", "Erling Haaland").recent(250_000, 3)]);
+    make_everything_due(&db.pool).await.unwrap();
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let name: String = sqlx::query_scalar("SELECT name FROM assets LIMIT 1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        name, "Marco Verratti",
+        "the identity anchor must not be overwritten by the provider that is \
+         contradicting it"
+    );
+    assert_eq!(
+        db.count("SELECT count(*) FROM market_observations").await,
+        before,
+        "and the other card's prices must not land on this card's history"
+    );
+    db.cleanup().await;
+}
+
+/// Every column of a fact table's unique index must also appear in its
+/// compression settings.
+///
+/// TimescaleDB cannot enforce uniqueness against a compressed chunk on a column
+/// it did not segment or order by. Get this wrong and the ledger keeps its only
+/// idempotency guarantee for thirty days and then quietly loses it, so a replay
+/// or a retry starts duplicating rows and nothing says so. It warns once, at
+/// migration time, into a log nobody reads twice.
+///
+/// This asserts the relationship rather than the current column list, so adding
+/// a column to either index without adding it to the compression settings fails
+/// here instead of in production a month later.
+#[tokio::test]
+async fn compression_covers_every_column_of_the_idempotency_indexes() {
+    let db = TestDb::new().await.unwrap();
+
+    let uncovered: Vec<(String, String, String)> = sqlx::query_as(
+        "WITH idx AS (
+             SELECT i.indrelid::regclass::text AS tbl,
+                    i.indexrelid::regclass::text AS idx,
+                    a.attname
+               FROM pg_index i
+               JOIN pg_attribute a
+                 ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+              WHERE i.indisunique
+                AND i.indrelid::regclass::text IN ('market_observations', 'ingest_polls')
+         ),
+         comp AS (
+             SELECT hypertable_name AS tbl, attname
+               FROM timescaledb_information.compression_settings
+         )
+         SELECT idx.tbl, idx.idx, idx.attname
+           FROM idx
+           LEFT JOIN comp ON comp.tbl = idx.tbl AND comp.attname = idx.attname
+          WHERE comp.attname IS NULL
+          ORDER BY 1, 3",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+
+    assert!(
+        uncovered.is_empty(),
+        "these unique-index columns are not in compress_segmentby or \
+         compress_orderby, so uniqueness stops being enforceable once the chunk \
+         compresses: {uncovered:?}"
+    );
+
+    // A guard that finds nothing because it looked at nothing is not a guard.
+    let checked: i64 = db
+        .count(
+            "SELECT count(*) FROM pg_index i
+              WHERE i.indisunique
+                AND i.indrelid::regclass::text IN ('market_observations', 'ingest_polls')",
+        )
+        .await;
+    assert_eq!(
+        checked, 2,
+        "both fact tables must have a unique index to check"
     );
     db.cleanup().await;
 }

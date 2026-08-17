@@ -10,8 +10,6 @@ use fc_market::ids::{Platform, RunStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const PS: Platform = Platform::Playstation;
-
 /// Serves the real router on a loopback port. Testing the handlers through HTTP
 /// is what makes the status codes part of the assertion.
 struct Server {

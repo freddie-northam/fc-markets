@@ -601,11 +601,18 @@ pub async fn most_valuable_assets(
         "SELECT id, version, rating
            FROM assets
           WHERE game_id = $1
-          ORDER BY (version <> 'base') DESC, rating DESC NULLS LAST, id
+          -- The base version is bound from BASE_VERSION, so this ranking and
+          -- the tier expression in domain.rs cannot come to disagree about which
+          -- version is the plain one. They stay two expressions on purpose: one
+          -- ranks six hundred rows, which belongs in SQL, and one assigns an
+          -- interval, which is unit tested in Rust. Only the value they share
+          -- needs a single definition.
+          ORDER BY (version <> $3) DESC, rating DESC NULLS LAST, id
           LIMIT $2",
     )
     .bind(game.0)
     .bind(limit)
+    .bind(crate::domain::BASE_VERSION)
     .fetch_all(pool)
     .await?;
 
@@ -695,22 +702,29 @@ pub async fn assets_needing_metadata(
     .await?)
 }
 
+/// Returns the asset AND the name we currently hold for it.
+///
+/// The name comes back because rule 1 has to be applied here too: the caller
+/// compares it against what the provider now claims before letting the provider
+/// rewrite it.
 pub async fn asset_by_external_id(
     pool: &PgPool,
     source: &str,
     game: GameId,
     external_id: &str,
-) -> Result<Option<AssetId>> {
-    let id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT asset_id FROM asset_source_ids
-          WHERE source = $1 AND game_id = $2 AND external_id = $3",
+) -> Result<Option<(AssetId, String)>> {
+    let row: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT si.asset_id, a.name
+           FROM asset_source_ids si
+           JOIN assets a ON a.id = si.asset_id
+          WHERE si.source = $1 AND si.game_id = $2 AND si.external_id = $3",
     )
     .bind(source)
     .bind(game.0)
     .bind(external_id)
     .fetch_optional(pool)
     .await?;
-    Ok(id.map(AssetId))
+    Ok(row.map(|(id, name)| (AssetId(id), name)))
 }
 
 /// Writes the canonical attributes and re-tiers the asset.
@@ -875,6 +889,23 @@ pub async fn replace_run_observations(
         if insert_observation(&mut tx, o, replacement).await? {
             written += 1;
         }
+    }
+
+    // A replay that resolves nothing must not be allowed to erase what it was
+    // meant to correct. This is the only path in the system that deletes ledger
+    // rows, and the two ways to reach it are ordinary: a parser change that
+    // rejects the whole payload, and an asset mapping that no longer resolves
+    // the identifiers the run recorded. Both would commit an empty rewrite and
+    // report success.
+    //
+    // Returning before the commit rolls the delete back. An operator who really
+    // does mean to drop a run's observations can do it deliberately; they should
+    // not get there by replaying.
+    if deleted > 0 && written == 0 {
+        anyhow::bail!(
+            "replay resolved nothing from run {original}, so it would delete {deleted} \
+             observations and write none; refusing to erase a history while correcting it"
+        );
     }
 
     tx.commit().await?;
