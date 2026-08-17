@@ -210,6 +210,7 @@ pub fn test_config() -> Config {
         source_api_key: None,
         daily_request_budget: 1_000,
         http_timeout: std::time::Duration::from_secs(5),
+        max_poll_age_seconds: 108_000,
         min_free_disk_bytes: 0,
         database_volume_bytes: None,
         disk_check_path: ".".into(),
@@ -690,13 +691,30 @@ pub async fn seed_poll_state(
     failures: i32,
     last_polled_at: Option<DateTime<Utc>>,
 ) -> Result<()> {
+    seed_poll_state_with_interval(pool, asset, market, 900, failures, last_polled_at).await
+}
+
+/// The same, with the polling band stated.
+///
+/// The band was hardcoded here, so no test could set it and no test could catch
+/// a check that depended on it. That is how the health staleness limit widened
+/// from four hours to a fortnight in silence.
+pub async fn seed_poll_state_with_interval(
+    pool: &PgPool,
+    asset: AssetId,
+    market: MarketId,
+    interval_seconds: i32,
+    failures: i32,
+    last_polled_at: Option<DateTime<Utc>>,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO asset_poll_state
            (asset_id, market_id, poll_interval_seconds, last_polled_at, consecutive_failures)
-         VALUES ($1,$2,900,$3,$4)",
+         VALUES ($1,$2,$3,$4,$5)",
     )
     .bind(asset.0)
     .bind(market.0)
+    .bind(interval_seconds)
     .bind(last_polled_at)
     .bind(failures)
     .execute(pool)

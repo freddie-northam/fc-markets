@@ -191,12 +191,12 @@ async fn a_stopped_ledger_makes_health_return_503() {
     seed_poll_state(&db.pool, asset, market, 0, Some(Utc::now()))
         .await
         .unwrap();
-    // The newest evidence that we looked is older than the largest poll interval.
+    // The newest evidence that we looked is older than the stated limit.
     seed_poll(
         &db.pool,
         asset,
         market,
-        Utc::now() - Duration::hours(6),
+        Utc::now() - Duration::hours(40),
         "written",
     )
     .await
@@ -253,6 +253,78 @@ async fn a_market_where_no_price_moves_keeps_health_at_200() {
         response.status(),
         200,
         "reading the observation table instead would call this an outage"
+    );
+    server.stop();
+    db.cleanup().await;
+}
+
+/// The regression guard.
+///
+/// The staleness limit used to be the SLOWEST polling band. Widening that band
+/// from four hours to a fortnight widened the alarm with it, so a dead feed
+/// stayed green for two weeks and no test objected. The limit must not depend on
+/// the bands at all: here every asset sits in a fourteen day band, and a feed
+/// silent for forty hours must still be a fault.
+#[tokio::test]
+async fn the_staleness_limit_does_not_follow_the_slowest_polling_band() {
+    let db = TestDb::new().await.unwrap();
+    let market = db.market(PS).await.unwrap();
+    let game = db.game().await.unwrap();
+    let asset = seed_asset(&db.pool, game.id, "Marco Verratti", 60, "base")
+        .await
+        .unwrap();
+    seed_poll_state_with_interval(&db.pool, asset, market, 1_209_600, 0, Some(Utc::now()))
+        .await
+        .unwrap();
+    seed_poll(
+        &db.pool,
+        asset,
+        market,
+        Utc::now() - Duration::hours(40),
+        "written",
+    )
+    .await
+    .unwrap();
+
+    let server = Server::start(&db, db.config()).await;
+    assert_eq!(
+        server.get("/health").await.status(),
+        503,
+        "a fourteen day band must not buy the feed fourteen days of silence"
+    );
+    server.stop();
+    db.cleanup().await;
+}
+
+/// The limit must also be loose enough to survive normal operation. The daily
+/// budget runs out mid-day and nothing is polled until the quota window reopens,
+/// so a healthy system routinely goes many hours without a poll.
+#[tokio::test]
+async fn a_gap_shorter_than_the_limit_is_not_a_fault() {
+    let db = TestDb::new().await.unwrap();
+    let market = db.market(PS).await.unwrap();
+    let game = db.game().await.unwrap();
+    let asset = seed_asset(&db.pool, game.id, "Marco Verratti", 91, "base")
+        .await
+        .unwrap();
+    seed_poll_state_with_interval(&db.pool, asset, market, 14_400, 0, Some(Utc::now()))
+        .await
+        .unwrap();
+    seed_poll(
+        &db.pool,
+        asset,
+        market,
+        Utc::now() - Duration::hours(20),
+        "written",
+    )
+    .await
+    .unwrap();
+
+    let server = Server::start(&db, db.config()).await;
+    assert_eq!(
+        server.get("/health").await.status(),
+        200,
+        "twenty hours is inside one budget cycle and must not page anyone"
     );
     server.stop();
     db.cleanup().await;
