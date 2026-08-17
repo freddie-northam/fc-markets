@@ -39,7 +39,20 @@ pub enum RunOutcome {
     Completed {
         run_id: RunId,
         status: RunStatus,
+        /// What the run did, carried out so the caller can report it without
+        /// reaching back into the database for figures the run already had.
+        summary: RunSummary,
     },
+}
+
+/// The outcome of one run, in the terms an operator cares about.
+#[derive(Debug, Clone, Default)]
+pub struct RunSummary {
+    pub written: i32,
+    pub unchanged: i32,
+    pub rejected: i32,
+    pub requests: u32,
+    pub reasons: Vec<String>,
 }
 
 /// Everything one run accumulates. Kept in one place so that the close path
@@ -284,7 +297,17 @@ async fn run_locked(runner: &Runner<'_>) -> Result<RunOutcome> {
         "run closed"
     );
 
-    Ok(RunOutcome::Completed { run_id, status })
+    Ok(RunOutcome::Completed {
+        run_id,
+        status,
+        summary: RunSummary {
+            written: tally.written,
+            unchanged: tally.unchanged,
+            rejected: tally.rejected,
+            requests: tally.requests,
+            reasons: tally.degraded.clone(),
+        },
+    })
 }
 
 /// The body of a run, separated so that `run` always closes the record.

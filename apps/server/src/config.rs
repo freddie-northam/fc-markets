@@ -51,7 +51,12 @@ pub struct Config {
     /// of "." measures the wrong thing and must be pointed at the data volume.
     pub disk_check_path: String,
     /// Optional so that tests and local development need no external service.
+    ///
+    /// The two are complementary, not alternatives. The heartbeat's silence is
+    /// the alarm and needs a service watching for it; the webhook's message is
+    /// the alarm and needs a human reading it.
     pub heartbeat_url: Option<String>,
+    pub alert_webhook_url: Option<String>,
     pub api_row_cap: i64,
     pub bind_address: String,
     /// Which game the run works on. One row of `games`, resolved by code.
@@ -102,9 +107,8 @@ impl Config {
             min_free_disk_bytes: num("MIN_FREE_DISK_BYTES", 5 * 1024 * 1024 * 1024)?,
             database_volume_bytes: opt_num("DATABASE_VOLUME_BYTES")?,
             disk_check_path: opt("DISK_CHECK_PATH", "."),
-            heartbeat_url: std::env::var("HEARTBEAT_URL")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            heartbeat_url: optional("HEARTBEAT_URL"),
+            alert_webhook_url: optional("ALERT_WEBHOOK_URL"),
             api_row_cap: num("API_ROW_CAP", 5_000)?,
             bind_address: opt("BIND_ADDRESS", "0.0.0.0:8090"),
             game_code: opt("GAME_CODE", "FC26"),
@@ -117,6 +121,12 @@ impl Config {
             backup_keep: num("BACKUP_KEEP", 30)?,
         })
     }
+}
+
+/// An optional string. Blank reads as unset, so a deployment can clear one by
+/// emptying it rather than by deleting the variable.
+fn optional(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
 fn req(key: &str) -> Result<String> {

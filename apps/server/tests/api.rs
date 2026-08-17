@@ -5,8 +5,8 @@ mod common;
 use chrono::{Duration, Utc};
 use common::*;
 use fc_market::config::Config;
-use fc_market::heartbeat;
 use fc_market::ids::{Platform, RunStatus};
+use fc_market::signals::heartbeat;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

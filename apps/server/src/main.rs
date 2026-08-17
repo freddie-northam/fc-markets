@@ -4,8 +4,9 @@ use fc_market::archive::S3Archive;
 use fc_market::config::Config;
 use fc_market::ids::RunId;
 use fc_market::ingest::{RunOutcome, Runner, fixture::FixtureSource, futdb::FutdbSource};
+use fc_market::signals::{heartbeat, notify};
 use fc_market::source::Source;
-use fc_market::{api, backup, db, heartbeat, ingest};
+use fc_market::{api, backup, db, ingest};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -147,8 +148,24 @@ async fn ingest_once(
         config,
     };
 
-    if let RunOutcome::Completed { status, .. } = ingest::run(&runner).await? {
+    if let RunOutcome::Completed {
+        status, summary, ..
+    } = ingest::run(&runner).await?
+    {
+        // Both signals fire here, at the one place a run closes, so neither
+        // entry point can forget one. The poll age is read once and shared:
+        // "ok" describes this run, not the feed, so a healthy run over a stalled
+        // ledger must still raise the alarm.
+        let poll_age = db::newest_poll_age_seconds(pool).await.ok().flatten();
         heartbeat::send(config.heartbeat_url.as_deref(), status).await;
+        notify::send(
+            config.alert_webhook_url.as_deref(),
+            status,
+            &summary,
+            poll_age,
+            config.max_poll_age_seconds,
+        )
+        .await;
     }
     Ok(())
 }

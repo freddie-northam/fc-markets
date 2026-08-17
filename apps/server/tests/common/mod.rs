@@ -215,6 +215,7 @@ pub fn test_config() -> Config {
         database_volume_bytes: None,
         disk_check_path: ".".into(),
         heartbeat_url: None,
+        alert_webhook_url: None,
         api_row_cap: 5_000,
         bind_address: "127.0.0.1:0".into(),
         game_code: GAME_CODE.into(),
