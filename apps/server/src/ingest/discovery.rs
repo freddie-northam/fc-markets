@@ -12,7 +12,7 @@
 use super::{Budget, Fetched, Run, Runner, Tally, fetch_and_archive};
 use crate::archive::Kind;
 use crate::db;
-use crate::domain::{names_match, poll_interval_seconds};
+use crate::domain::{AssetAttributes, names_match, poll_interval_seconds};
 use anyhow::Result;
 use tracing::{info, warn};
 
@@ -20,6 +20,50 @@ use tracing::{info, warn};
 /// slow step last ran, without a table of its own.
 const DISCOVERY_STEP: &str = "discovery_ran";
 const METADATA_STEP: &str = "metadata_ran";
+
+/// A hard stop on the asset list walk. The budget bounds it only at thousands
+/// of requests, so a provider that always claims one more page would spend the
+/// day's quota before the budget noticed.
+const MAX_ASSET_LIST_PAGES: u32 = 2_000;
+
+/// Writes card attributes after rule 1. This is the ONLY place that writes these
+/// columns. Two steps supply them: the metadata step, and the asset list of a
+/// provider whose list holds whole records. A check at one door and not the
+/// other is the shape that already produced three defects here.
+async fn apply_attributes(
+    runner: &Runner<'_>,
+    game: &db::Game,
+    source: &str,
+    parsed: &[AssetAttributes],
+) -> Result<(usize, usize)> {
+    let mut updated = 0;
+    let mut repointed = 0;
+    for attrs in parsed {
+        let Some((asset, held_name)) =
+            db::asset_by_external_id(runner.pool, source, game.id, &attrs.external_id).await?
+        else {
+            continue;
+        };
+        // A name that disagrees with the resolved asset means the provider
+        // re-pointed the identifier at a different card. Without this check the
+        // rename only had to survive one refresh, after which every later price
+        // for the new card landed on the old card's history.
+        if !names_match(&attrs.name, &held_name) {
+            repointed += 1;
+            warn!(
+                external_id = %attrs.external_id,
+                held = %held_name,
+                claimed = %attrs.name,
+                "the provider now names a different card for this identifier"
+            );
+            continue;
+        }
+        let interval = poll_interval_seconds(&attrs.version, attrs.rating);
+        db::update_asset_attributes(runner.pool, asset, attrs, interval).await?;
+        updated += 1;
+    }
+    Ok((updated, repointed))
+}
 
 /// Enumerates the source's full asset list and records identifiers we have not
 /// seen.
@@ -45,60 +89,128 @@ pub(crate) async fn maybe_discover(
     {
         return Ok(());
     }
-    if !budget.take() {
-        tally.degrade("the daily request budget stopped asset discovery");
-        return Ok(());
-    }
-    tally.requests += 1;
-    db::record_request(runner.pool, run.id).await?;
-    db::touch_heartbeat(runner.pool, run.id).await?;
+    let mut known = db::known_external_ids(runner.pool, source, game.id).await?;
+    let mut listed = 0usize;
+    let mut added = 0usize;
+    let mut attributed = 0usize;
+    let mut repointed = 0usize;
+    let mut pages = 0u32;
+    let mut page = 1u32;
+    // Only a walk that reached the provider's last page may mark the step done.
+    // The flag suppresses discovery for a whole cadence, so a walk cut short on
+    // budget would hide the rest of the catalogue until tomorrow.
+    let mut complete = true;
 
-    // The asset list decides which cards exist at all, so a change in it must
-    // stay auditable. Same archive-before-parse rule as prices.
-    let Fetched::Ready(envelope, _) = fetch_and_archive(
-        runner,
-        tally,
-        run,
-        Kind::AssetList,
-        0,
-        runner.source.fetch_asset_list(),
-    )
-    .await
-    else {
-        return Ok(());
-    };
-
-    // A parse failure here degrades the run rather than ending it. The asset
-    // list changing shape must not also stop us reading prices for the assets we
-    // already know: that would turn a discovery problem into a gap in the ledger.
-    let listings = match runner.source.parse_asset_list(&envelope) {
-        Ok(listings) => listings,
-        Err(e) => {
-            tally.degrade(format!("the asset list could not be parsed: {e}"));
-            return Ok(());
+    loop {
+        if pages >= MAX_ASSET_LIST_PAGES {
+            tally.degrade(format!(
+                "the asset list did not end within {MAX_ASSET_LIST_PAGES} pages"
+            ));
+            complete = false;
+            break;
         }
-    };
-    let known = db::known_external_ids(runner.pool, source, game.id).await?;
-
-    let mut added = 0;
-    for listing in &listings {
-        if known.contains(&listing.external_id) {
-            continue;
+        if !budget.take() {
+            tally.degrade("the daily request budget stopped asset discovery");
+            complete = false;
+            break;
         }
-        db::insert_discovered_asset(
-            runner.pool,
-            game.id,
-            source,
-            &listing.external_id,
-            &listing.name,
+        tally.requests += 1;
+        db::record_request(runner.pool, run.id).await?;
+        // The reaper only sees the heartbeat, and a catalogue walk can outlast
+        // ABANDON_AFTER before the price loop starts.
+        db::touch_heartbeat(runner.pool, run.id).await?;
+        // Archive before parse, once per response, so replay sees what we saw.
+        let Fetched::Ready(envelope, _) = fetch_and_archive(
+            runner,
+            tally,
+            run,
+            Kind::AssetList,
+            page as usize,
+            runner.source.fetch_asset_list(page),
         )
-        .await?;
-        added += 1;
+        .await
+        else {
+            complete = false;
+            break;
+        };
+        pages += 1;
+
+        // A parse failure degrades the run and does not end it. A new list shape
+        // must not stop prices for the assets we hold, because that turns a
+        // discovery problem into a gap in the ledger.
+        let listings = match runner.source.parse_asset_list(&envelope) {
+            Ok(listings) => listings,
+            Err(e) => {
+                tally.degrade(format!("asset list page {page} could not be parsed: {e}"));
+                complete = false;
+                break;
+            }
+        };
+        listed += listings.len();
+
+        for listing in &listings {
+            // Tracked as the walk goes. A card that the provider repeats across
+            // two pages would otherwise be inserted twice.
+            if !known.insert(listing.external_id.clone()) {
+                continue;
+            }
+            db::insert_discovered_asset(
+                runner.pool,
+                game.id,
+                source,
+                &listing.external_id,
+                &listing.name,
+            )
+            .await?;
+            added += 1;
+        }
+
+        // Free attributes: the page is already fetched, paid for and archived.
+        // A provider whose list holds names only returns nothing here, and the
+        // metadata step does the work instead.
+        match runner.source.parse_asset_list_attributes(&envelope) {
+            Ok(attrs) => {
+                let (updated, bad) = apply_attributes(runner, game, source, &attrs).await?;
+                attributed += updated;
+                repointed += bad;
+            }
+            Err(e) => {
+                tally.degrade(format!(
+                    "attributes on asset list page {page} could not be parsed: {e}"
+                ));
+                complete = false;
+            }
+        }
+
+        match runner.source.next_asset_list_page(&envelope) {
+            // The page must increase. A provider that answers with the page we
+            // just read would otherwise spin until the budget died.
+            Some(next) if next > page => page = next,
+            Some(next) => {
+                tally.degrade(format!(
+                    "the asset list asked us to go from page {page} back to {next}"
+                ));
+                complete = false;
+                break;
+            }
+            None => break,
+        }
     }
 
-    tally.steps.push(DISCOVERY_STEP);
-    db::record_step(runner.pool, run.id, DISCOVERY_STEP).await?;
-    info!(listed = listings.len(), added, "asset discovery finished");
+    if repointed > 0 {
+        tally.degrade(format!(
+            "{repointed} identifiers now name a different card, so their attributes were not applied"
+        ));
+    }
+
+    if complete {
+        tally.steps.push(DISCOVERY_STEP);
+        db::record_step(runner.pool, run.id, DISCOVERY_STEP).await?;
+    }
+    info!(
+        pages,
+        listed, added, attributed, complete, "asset discovery finished"
+    );
     Ok(())
 }
 
@@ -199,35 +311,11 @@ pub(crate) async fn maybe_refresh_metadata(
             }
         };
 
-        for attrs in parsed {
-            let Some((asset, held_name)) =
-                db::asset_by_external_id(runner.pool, source, game.id, &attrs.external_id).await?
-            else {
-                continue;
-            };
-
-            // Rule 1, at the other door. The price path rejects a payload whose
-            // name disagrees with the resolved asset, because that is a provider
-            // re-pointing an identifier at a different card. This step writes
-            // that same name, from the same provider. Without the check a
-            // re-pointed identifier only had to survive until the next refresh to
-            // be adopted, and every later price for the new card would then match
-            // the renamed asset and land on the old card's history.
-            if !names_match(&attrs.name, &held_name) {
-                repointed += 1;
-                warn!(
-                    external_id = %attrs.external_id,
-                    held = %held_name,
-                    claimed = %attrs.name,
-                    "the provider now names a different card for this identifier"
-                );
-                continue;
-            }
-
-            let interval = poll_interval_seconds(&attrs.version, attrs.rating);
-            db::update_asset_attributes(runner.pool, asset, &attrs, interval).await?;
-            updated += 1;
-        }
+        // The identity check and the write both live in apply_attributes, which
+        // the asset list harvest also calls. See the note there on why.
+        let (written, bad) = apply_attributes(runner, game, source, &parsed).await?;
+        updated += written;
+        repointed += bad;
     }
 
     // Completion is measured against the work, not against the loop. The stale

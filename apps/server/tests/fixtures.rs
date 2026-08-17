@@ -77,7 +77,7 @@ async fn an_identifier_the_provider_does_not_know_returns_nothing() {
 async fn the_asset_list_and_the_card_attributes_parse_from_disk() {
     let source = source();
 
-    let listing = source.fetch_asset_list().await.unwrap();
+    let listing = source.fetch_asset_list(1).await.unwrap();
     let assets = source.parse_asset_list(&listing).unwrap();
     assert_eq!(assets.len(), 21);
 

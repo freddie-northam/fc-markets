@@ -72,9 +72,31 @@ pub trait Source: Send + Sync {
     /// the reason the envelope stores them.
     fn parse_prices(&self, envelope: &Envelope) -> anyhow::Result<Vec<ParsedQuote>>;
 
-    async fn fetch_asset_list(&self) -> FetchResult;
+    /// Fetches ONE page of the asset list. Pages start at 1. The caller charges
+    /// the budget and archives each response, so a module that walked its own
+    /// pages would spend a quota the budget counted once, and would collapse
+    /// many responses into one object that replay cannot reproduce.
+    async fn fetch_asset_list(&self, page: u32) -> FetchResult;
 
     fn parse_asset_list(&self, envelope: &Envelope) -> anyhow::Result<Vec<Listing>>;
+
+    /// The next page, read from the response just received. `None` ends the
+    /// walk, so a provider that answers whole needs no implementation.
+    fn next_asset_list_page(&self, _envelope: &Envelope) -> Option<u32> {
+        None
+    }
+
+    /// Attributes the asset list already carries. A provider that answers the
+    /// list with whole records owes nothing more for them, because the caller
+    /// has already fetched, paid for and archived the page. The caller applies
+    /// the same identity check here as it applies to the metadata step, so this
+    /// is not a way around rule 1.
+    fn parse_asset_list_attributes(
+        &self,
+        _envelope: &Envelope,
+    ) -> anyhow::Result<Vec<AssetAttributes>> {
+        Ok(Vec::new())
+    }
 
     async fn fetch_metadata(&self, external_ids: &[String]) -> FetchResult;
 
