@@ -7,13 +7,34 @@
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-FROM rust:1.97-bookworm AS build
+# Dependencies build in a layer of their own, keyed on the manifests rather than
+# on the source. A single layer holding both meant every commit recompiled tokio,
+# axum, sqlx, reqwest and aws-sdk-s3, none of which had changed, which cost
+# about fifteen minutes a deploy.
+FROM rust:1.97-bookworm AS chef
 
+# Pinned. An unpinned tool would change the recipe format under us and rebuild
+# every dependency on a day we changed nothing.
+RUN cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /src
+
+# The recipe describes the dependency graph and nothing else. cargo-chef stubs
+# the source out before it writes one, so editing our code leaves the recipe
+# byte for byte identical and the cooked layer stays cached.
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY apps/server/Cargo.toml apps/server/Cargo.toml
+COPY apps/server/src apps/server/src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
 
 # The migrations are copied before the build on purpose. sqlx::migrate! embeds
 # them into the binary at COMPILE time, so a build without them produces a
-# server that cannot migrate anything.
+# server that cannot migrate anything. They are copied here and not before the
+# cook step, because a new migration must not rebuild every dependency.
 COPY Cargo.toml Cargo.lock ./
 COPY apps/server/Cargo.toml apps/server/Cargo.toml
 COPY migrations migrations
