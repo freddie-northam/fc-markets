@@ -13,8 +13,9 @@ const INGEST_LOCK: i64 = 0x0000_FC1A_55E7;
 
 /// The interval assumed when no asset has one yet. It is the slowest tier, so a
 /// health check falling back to it waits the longest before crying outage. One
-/// definition, because the scheduler and the health check must agree on it.
-pub const DEFAULT_POLL_INTERVAL_SECONDS: i32 = 14_400;
+/// definition, because the scheduler and the health check must agree on it. It
+/// must stay equal to the slowest band of `poll_interval_seconds`.
+pub const DEFAULT_POLL_INTERVAL_SECONDS: i32 = 1_209_600;
 
 /// How long a run may go without a heartbeat before the next start declares it
 /// dead. A run that dies leaves its status at `running` for ever, which makes the

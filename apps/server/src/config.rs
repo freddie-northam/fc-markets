@@ -10,10 +10,12 @@ pub struct Config {
     pub object_store_bucket: String,
     pub object_store_access_key: String,
     pub object_store_secret_key: String,
-    /// Read by a provider module. No provider is available yet, so nothing
-    /// consumes these two today. They stay because section 4.5 requires the
-    /// source client to set an explicit request timeout, and a source added
-    /// without one would retry silently and spend the quota twice.
+    /// Which provider the run reads. `fixture` serves archived payloads from
+    /// disk; `futdb` reads api.fut-db.com.
+    pub source_name: String,
+    pub source_base_url: String,
+    /// Section 4.5 requires the source client to set an explicit request
+    /// timeout. A source without one retries silently and spends the quota twice.
     pub source_api_key: Option<String>,
     pub daily_request_budget: u32,
     pub http_timeout: Duration,
@@ -33,7 +35,9 @@ pub struct Config {
     /// Which game the run works on. One row of `games`, resolved by code.
     pub game_code: String,
     /// How many assets the request budget can afford to follow. Section 4.7 sets
-    /// this from what the source allows, not from what the code can manage.
+    /// this from what the source allows, not from what the code can manage. The
+    /// tier bands hold the whole measured catalogue of 27,121 inside 18,000
+    /// requests a day, so the default covers it with room for growth.
     pub asset_coverage: i64,
     pub discovery_cadence_seconds: i64,
     pub metadata_cadence_seconds: i64,
@@ -63,7 +67,11 @@ impl Config {
             object_store_bucket: req("OBJECT_STORE_BUCKET")?,
             object_store_access_key: req("OBJECT_STORE_ACCESS_KEY")?,
             object_store_secret_key: req("OBJECT_STORE_SECRET_KEY")?,
-            source_api_key: std::env::var("SOURCE_API_KEY").ok(),
+            source_name: opt("SOURCE", "fixture"),
+            source_base_url: opt("SOURCE_BASE_URL", crate::ingest::futdb::DEFAULT_BASE_URL),
+            source_api_key: std::env::var("SOURCE_API_KEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             daily_request_budget: num("DAILY_REQUEST_BUDGET", 18_000)?,
             http_timeout: Duration::from_secs(num("HTTP_TIMEOUT_SECONDS", 30)?),
             min_free_disk_bytes: num("MIN_FREE_DISK_BYTES", 5 * 1024 * 1024 * 1024)?,
@@ -74,7 +82,7 @@ impl Config {
             api_row_cap: num("API_ROW_CAP", 5_000)?,
             bind_address: opt("BIND_ADDRESS", "0.0.0.0:8090"),
             game_code: opt("GAME_CODE", "FC26"),
-            asset_coverage: num("ASSET_COVERAGE", 600)?,
+            asset_coverage: num("ASSET_COVERAGE", 40_000)?,
             discovery_cadence_seconds: num("DISCOVERY_CADENCE_SECONDS", 86_400)?,
             metadata_cadence_seconds: num("METADATA_CADENCE_SECONDS", 604_800)?,
             fixture_dir: opt("FIXTURE_DIR", "fixtures/fixture"),

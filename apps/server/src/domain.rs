@@ -116,16 +116,28 @@ pub fn canonical_version(raw: Option<String>) -> String {
 /// computable predicate, not an editorial judgement, so that discovery can
 /// create poll state without a human deciding anything.
 ///
-/// A promotional card or a high rating polls often because its price moves
-/// often. Low rated base cards move slowly and would waste the request budget.
+/// The bands come from a measured catalogue of 27,121 assets against a budget
+/// of 18,000 requests a day, where one request prices both platforms. They spend
+/// about 16,400 a day and leave the rest for discovery and retries. A faster top
+/// band does not fit: 1,193 assets at 4 hours already take 7,158 of it.
+///
+/// An asset with no rating yet falls to the slowest band, so a catalogue that
+/// arrives before its attributes cannot drain the budget.
 pub fn poll_interval_seconds(version: &str, rating: Option<i16>) -> i32 {
-    let rating = rating.unwrap_or(0);
-    if version != BASE_VERSION || rating >= 88 {
-        900
-    } else if rating >= 83 {
-        3_600
+    let by_rating = match rating.unwrap_or(0) {
+        r if r >= 90 => 14_400,
+        r if r >= 86 => 43_200,
+        r if r >= 83 => 86_400,
+        r if r >= 80 => 172_800,
+        r if r >= 75 => 604_800,
+        _ => 1_209_600,
+    };
+    // A promotional card is the traded end of the market, so it never falls to
+    // the slow bands whatever its rating.
+    if version == BASE_VERSION {
+        by_rating
     } else {
-        14_400
+        by_rating.min(86_400)
     }
 }
 
@@ -228,21 +240,32 @@ mod tests {
     #[test]
     fn casing_from_a_provider_cannot_change_the_tier() {
         let folded = canonical_version(Some("BASE".into()));
-        assert_eq!(poll_interval_seconds(&folded, Some(70)), 14_400);
+        assert_eq!(poll_interval_seconds(&folded, Some(70)), 1_209_600);
     }
 
     #[test]
-    fn promotional_cards_poll_fastest_whatever_their_rating() {
-        assert_eq!(poll_interval_seconds("tots", Some(84)), 900);
-        assert_eq!(poll_interval_seconds("icon", Some(70)), 900);
+    fn promotional_cards_never_fall_to_the_slow_bands() {
+        assert_eq!(poll_interval_seconds("tots", Some(70)), 86_400);
+        assert_eq!(poll_interval_seconds("icon", Some(81)), 86_400);
+        // A promotion does not slow a card that its rating already polls faster.
+        assert_eq!(poll_interval_seconds("tots", Some(91)), 14_400);
     }
 
     #[test]
     fn base_cards_tier_by_rating() {
-        assert_eq!(poll_interval_seconds("base", Some(91)), 900);
-        assert_eq!(poll_interval_seconds("base", Some(85)), 3_600);
-        assert_eq!(poll_interval_seconds("base", Some(72)), 14_400);
-        assert_eq!(poll_interval_seconds("base", None), 14_400);
+        assert_eq!(poll_interval_seconds("base", Some(91)), 14_400);
+        assert_eq!(poll_interval_seconds("base", Some(87)), 43_200);
+        assert_eq!(poll_interval_seconds("base", Some(85)), 86_400);
+        assert_eq!(poll_interval_seconds("base", Some(81)), 172_800);
+        assert_eq!(poll_interval_seconds("base", Some(77)), 604_800);
+        assert_eq!(poll_interval_seconds("base", Some(72)), 1_209_600);
+    }
+
+    /// An asset discovered before its attributes must not take a fast band, or a
+    /// fresh catalogue would drain the budget on cards we cannot yet value.
+    #[test]
+    fn an_asset_without_a_rating_takes_the_slowest_band() {
+        assert_eq!(poll_interval_seconds("base", None), 1_209_600);
     }
 
     #[test]
@@ -250,9 +273,43 @@ mod tests {
         for rating in 0..=99i16 {
             for version in ["base", "tots", "icon"] {
                 let secs = poll_interval_seconds(version, Some(rating));
-                assert!(matches!(secs, 900 | 3_600 | 14_400), "rating {rating}");
+                assert!(
+                    matches!(
+                        secs,
+                        14_400 | 43_200 | 86_400 | 172_800 | 604_800 | 1_209_600
+                    ),
+                    "rating {rating}"
+                );
             }
         }
+    }
+
+    /// The bands must fit the budget. A change that spends more than a day's
+    /// requests fails here rather than in production a day later.
+    #[test]
+    fn the_measured_catalogue_fits_the_daily_budget() {
+        // Measured on 2026-08-17 from a 500-player sample of 27,121 assets:
+        // (count, rating, version).
+        let catalogue = [
+            (1_193, 91, "icon"),
+            (3_146, 87, "tots"),
+            (705, 84, "tots"),
+            (217, 81, "tots"),
+            (1_193, 81, "base"),
+            (868, 77, "base"),
+            (19_798, 65, "base"),
+        ];
+        let daily: f64 = catalogue
+            .iter()
+            .map(|(count, rating, version)| {
+                let interval = poll_interval_seconds(version, Some(*rating)) as f64;
+                *count as f64 * 86_400.0 / interval
+            })
+            .sum();
+        assert!(
+            daily <= 18_000.0,
+            "the tiers ask for {daily:.0} requests a day"
+        );
     }
 
     #[test]

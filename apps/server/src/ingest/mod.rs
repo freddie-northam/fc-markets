@@ -8,6 +8,7 @@
 pub mod discovery;
 pub mod drift;
 pub mod fixture;
+pub mod futdb;
 
 use crate::archive::{Archive, Envelope, Kind, object_key};
 use crate::config::Config;
