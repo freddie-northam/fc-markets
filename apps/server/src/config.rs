@@ -24,6 +24,14 @@ pub struct Config {
     pub source_api_key: Option<String>,
     pub daily_request_budget: u32,
     pub http_timeout: Duration,
+    /// How stale the newest poll may get before /health calls it an outage.
+    ///
+    /// Stated rather than derived. The daily request budget, not the polling
+    /// bands, is what bounds how often anything is polled: the budget runs out
+    /// mid-day and nothing is polled until the quota window reopens. So the
+    /// honest assertion is "at least one poll a day", with room for the window
+    /// to drift.
+    pub max_poll_age_seconds: i32,
     pub min_free_disk_bytes: u64,
     /// The database volume's capacity, in bytes.
     ///
@@ -90,6 +98,7 @@ impl Config {
                 .filter(|s| !s.trim().is_empty()),
             daily_request_budget: num("DAILY_REQUEST_BUDGET", 18_000)?,
             http_timeout: Duration::from_secs(num("HTTP_TIMEOUT_SECONDS", 30)?),
+            max_poll_age_seconds: num("MAX_POLL_AGE_SECONDS", 108_000)?,
             min_free_disk_bytes: num("MIN_FREE_DISK_BYTES", 5 * 1024 * 1024 * 1024)?,
             database_volume_bytes: opt_num("DATABASE_VOLUME_BYTES")?,
             disk_check_path: opt("DISK_CHECK_PATH", "."),

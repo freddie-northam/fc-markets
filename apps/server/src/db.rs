@@ -869,14 +869,10 @@ pub async fn newest_poll_age_seconds(pool: &PgPool) -> Result<Option<f64>> {
     .await?)
 }
 
-pub async fn largest_poll_interval_seconds(pool: &PgPool) -> Result<i32> {
-    Ok(
-        sqlx::query_scalar("SELECT COALESCE(max(poll_interval_seconds), $1) FROM asset_poll_state")
-            .bind(DEFAULT_POLL_INTERVAL_SECONDS)
-            .fetch_one(pool)
-            .await?,
-    )
-}
+// largest_poll_interval_seconds is deliberately gone. Health used it as its
+// staleness threshold, which tied the alarm to the SLOWEST band. Widening that
+// band from four hours to a fortnight silently widened the alarm with it, and
+// nothing failed to say so. The threshold is now stated in config instead.
 
 // ---------------------------------------------------------------------------
 // Replay

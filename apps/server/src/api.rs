@@ -58,9 +58,17 @@ async fn health(State(s): State<AppState>) -> (StatusCode, Json<Health>) {
         }
         Ok(None) => {} // Nothing polled yet. A fresh install is not a fault.
         Ok(Some(age)) => {
-            let limit = db::largest_poll_interval_seconds(&s.pool)
-                .await
-                .unwrap_or(db::DEFAULT_POLL_INTERVAL_SECONDS);
+            // Stated, not derived from the polling bands. It used to take the
+            // SLOWEST band, which was four hours when the bands were written and
+            // is now a fortnight, so the check silently stopped detecting
+            // anything: a dead feed stayed green for two weeks.
+            //
+            // It cannot be derived from the fastest band either, because the
+            // daily request budget is what actually bounds polling. The budget
+            // runs out mid-day and nothing is polled until the quota window
+            // reopens, so a threshold shorter than a day goes red every day on a
+            // perfectly healthy system.
+            let limit = s.config.max_poll_age_seconds;
             if age > f64::from(limit) {
                 reasons.push(format!("no poll for {age:.0}s, limit {limit}s"));
             }
