@@ -15,6 +15,11 @@ use tracing_subscriber::EnvFilter;
 /// One day between dumps. Section 4.8 keeps the last 30 of them.
 const BACKUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How long to wait after a dump fails before trying again. Without it a dump
+/// that fails for a permanent reason, a missing pg_dump say, retries in a tight
+/// loop and fills the log instead of the bucket.
+const RETRY_AFTER_A_FAILED_DUMP: Duration = Duration::from_secs(60 * 60);
+
 #[derive(Parser)]
 #[command(name = "fc-market", about = "FC Market ledger and terminal")]
 struct Cli {
@@ -241,20 +246,20 @@ async fn ingest_interval(pool: PgPool, archive: Arc<S3Archive>, config: Arc<Conf
 
 /// `pg_dump` opens its own connection, so this task needs no pool.
 async fn backup_interval(archive: Arc<S3Archive>, config: Arc<Config>) {
-    // Starts one interval from now, NOT immediately. A tokio interval fires its
-    // first tick straight away, and with restart: unless-stopped a crash loop
-    // would then dump on every start: thirty restarts would push the whole
-    // thirty day history out through prune and leave thirty copies of one
-    // moment. The ingest loop wants its immediate first tick; this one must not
-    // have it.
-    let mut ticker = tokio::time::interval_at(
-        tokio::time::Instant::now() + BACKUP_INTERVAL,
-        BACKUP_INTERVAL,
-    );
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
     loop {
-        ticker.tick().await;
+        // Asked before every wait, not once at startup, so a dump taken by hand
+        // or by an earlier process is respected.
+        let wait = match backup::newest_taken_at(&archive).await {
+            Ok(newest) => backup::wait_for(newest, chrono::Utc::now(), BACKUP_INTERVAL),
+            Err(e) => {
+                // Cannot tell when the last dump was, so do NOT dump blind: a
+                // listing that stays broken would otherwise dump on every loop.
+                tracing::error!(error = %e, "cannot read the dump history; waiting a full interval");
+                BACKUP_INTERVAL
+            }
+        };
+        tokio::time::sleep(wait).await;
+
         let result = backup::run(
             &archive,
             &config.database_url,
@@ -265,6 +270,10 @@ async fn backup_interval(archive: Arc<S3Archive>, config: Arc<Config>) {
         .await;
         if let Err(e) = result {
             tracing::error!(error = %e, "the nightly dump failed");
+            // A failure leaves the history unchanged, so the next loop would
+            // compute a zero wait and retry at once. Pause first: a dump that
+            // fails because pg_dump is missing fails identically every second.
+            tokio::time::sleep(RETRY_AFTER_A_FAILED_DUMP).await;
         }
     }
 }

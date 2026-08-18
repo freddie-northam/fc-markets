@@ -63,6 +63,54 @@ pub async fn run(
     Ok(key)
 }
 
+/// When the newest dump was taken, read out of its own name.
+///
+/// The name is the record. A separate table would be a second source of truth,
+/// and the `backup` command can be run by hand at any time without touching one.
+pub async fn newest_taken_at(archive: &S3Archive) -> Result<Option<DateTime<Utc>>> {
+    let mut keys = archive.list(PREFIX).await?;
+    // Keys start with a zero padded UTC timestamp, so a lexical sort is a
+    // chronological one. The same property prune relies on.
+    keys.sort();
+    Ok(keys.last().and_then(|key| taken_at(key)))
+}
+
+/// Parses the timestamp a dump key carries.
+fn taken_at(key: &str) -> Option<DateTime<Utc>> {
+    let stamp = key.rsplit('/').next()?.strip_suffix(".dump")?;
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%SZ")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+/// How long to wait before the next dump is due.
+///
+/// Scheduling from the last DUMP rather than from process start is the whole
+/// point. A timer anchored to uptime restarts with the process, so on a service
+/// that deploys often the first tick never matures and no dump is ever taken.
+/// That is not theoretical: eight deploys in one day left this ledger with none.
+///
+/// It keeps the property the uptime timer was protecting. A crash loop cannot
+/// dump repeatedly, because the dump it just took is recent and the next start
+/// sees it and waits.
+pub fn wait_for(
+    newest: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    interval: std::time::Duration,
+) -> std::time::Duration {
+    let Some(newest) = newest else {
+        // Nothing has ever been dumped, so one is due now. A ledger with no
+        // backup at all is the state worth leaving quickest.
+        return std::time::Duration::ZERO;
+    };
+    match now.signed_duration_since(newest).to_std() {
+        // A dump stamped in the future means a clock disagreement, not a dump
+        // that is overdue. Waiting a full interval is the safe reading.
+        Err(_) => interval,
+        Ok(age) => interval.saturating_sub(age),
+    }
+}
+
 /// Splits the password out of a connection URL.
 ///
 /// An argument is visible to every user on the host through the process list, so
@@ -174,6 +222,82 @@ mod tests {
             dumps(&["20260101T000000Z"]),
             "keep zero must still leave the newest dump standing"
         );
+    }
+
+    const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// The defect this replaced. The timer was anchored to process start, so a
+    /// service that deploys often never reached its first tick: eight deploys in
+    /// one day left the ledger with no dump at all.
+    #[test]
+    fn a_ledger_that_has_never_been_dumped_is_due_at_once() {
+        assert_eq!(
+            wait_for(None, at("2026-08-18T09:00:00Z"), DAY),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// The property the uptime timer was protecting, which must survive. A
+    /// restart moments after a dump must not take another.
+    #[test]
+    fn a_restart_just_after_a_dump_waits_almost_a_full_day() {
+        let wait = wait_for(
+            Some(at("2026-08-18T09:00:00Z")),
+            at("2026-08-18T09:05:00Z"),
+            DAY,
+        );
+        assert_eq!(wait.as_secs(), 24 * 60 * 60 - 300);
+    }
+
+    #[test]
+    fn a_dump_older_than_the_interval_is_due_at_once() {
+        assert_eq!(
+            wait_for(
+                Some(at("2026-08-15T09:00:00Z")),
+                at("2026-08-18T09:00:00Z"),
+                DAY
+            ),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// A clock disagreement must not read as an overdue dump.
+    #[test]
+    fn a_dump_stamped_in_the_future_waits_rather_than_dumping() {
+        assert_eq!(
+            wait_for(
+                Some(at("2026-08-19T09:00:00Z")),
+                at("2026-08-18T09:00:00Z"),
+                DAY
+            ),
+            DAY
+        );
+    }
+
+    #[test]
+    fn the_timestamp_is_read_back_out_of_the_key() {
+        assert_eq!(
+            taken_at("backup/pg/20260818T091500Z.dump"),
+            Some(at("2026-08-18T09:15:00Z"))
+        );
+    }
+
+    /// A key we cannot read must not be treated as a fresh dump, or a single
+    /// malformed name would suppress backups for a day.
+    #[test]
+    fn an_unreadable_key_yields_no_timestamp() {
+        for key in [
+            "backup/pg/not-a-timestamp.dump",
+            "backup/pg/20260818T091500Z",
+            "backup/pg/.dump",
+            "",
+        ] {
+            assert_eq!(taken_at(key), None, "{key}");
+        }
     }
 
     #[test]
