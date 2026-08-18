@@ -14,6 +14,7 @@
 //! the most damage: an unchanged illiquid price reads as a calm market rather
 //! than an absent one.
 
+use super::trust_window;
 use crate::ids::MarketId;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -62,7 +63,7 @@ SELECT t.market_id,
        -- Measured from as_of, not from now, or a band's staleness would
        -- change every time the same past question was asked.
        max(EXTRACT(EPOCH FROM ($2 - t.observed_at))::float8) / 3600.0 AS stalest_hours
-FROM trusted_latest_prices($2) t
+FROM trusted_latest_prices($2, $3) t
 JOIN assets a ON a.id = t.asset_id
 WHERE t.market_id = $1
 GROUP BY t.market_id, a.version, rating_band(a.rating)
@@ -80,6 +81,7 @@ pub async fn snapshot(
     Ok(sqlx::query_as::<_, CohortSnapshot>(COHORT_SNAPSHOT_SQL)
         .bind(market.0)
         .bind(as_of)
+        .bind(trust_window())
         .fetch_all(pool)
         .await?)
 }

@@ -124,6 +124,31 @@ pub fn canonical_version(raw: Option<String>) -> String {
 /// cannot have moved, and spends a quota that could have covered another card.
 pub const UPSTREAM_REFRESH_SECONDS: i32 = 86_400;
 
+/// The slowest band. Stated once, because two other things must agree with it.
+pub const SLOWEST_POLL_INTERVAL_SECONDS: i32 = 3 * UPSTREAM_REFRESH_SECONDS;
+
+/// How old a price may be before a derivation stops trusting it.
+///
+/// It MUST exceed the slowest polling band, and the margin is the point. An
+/// asset becomes due at the end of its band, and the budget decides when a due
+/// asset is actually read, so an overdue asset is normal. If the trust window
+/// equalled the band, every one of the 19,798 assets in the slow tier would drop
+/// out of the class median and the cohorts while waiting for a poll that was
+/// only just late. Overdue is not the same as unknown.
+///
+/// Twice the slowest band gives a full extra cycle of slack.
+pub const TRUSTED_PRICE_MAX_AGE_SECONDS: i32 = 2 * SLOWEST_POLL_INTERVAL_SECONDS;
+
+// Checked when the crate compiles rather than when a test runs, because this is
+// a fact about two constants and a build that violates it should not exist. The
+// margin must be a full cycle: an asset falls due at the end of its band and the
+// budget decides when a due asset is actually read, so overdue is normal.
+const _: () = assert!(
+    TRUSTED_PRICE_MAX_AGE_SECONDS - SLOWEST_POLL_INTERVAL_SECONDS
+        >= SLOWEST_POLL_INTERVAL_SECONDS,
+    "the trust window must exceed the slowest polling band by a full cycle"
+);
+
 /// Assigns a polling interval from columns we already hold. A tier is a
 /// computable predicate, not an editorial judgement, so that discovery can
 /// create poll state without a human deciding anything.
@@ -153,7 +178,7 @@ pub fn poll_interval_seconds(version: &str, rating: Option<i16>) -> i32 {
     if version != BASE_VERSION || rating.unwrap_or(0) >= 75 {
         UPSTREAM_REFRESH_SECONDS
     } else {
-        3 * UPSTREAM_REFRESH_SECONDS
+        SLOWEST_POLL_INTERVAL_SECONDS
     }
 }
 
@@ -324,6 +349,18 @@ mod tests {
             for version in ["base", "tots", "icon"] {
                 let secs = poll_interval_seconds(version, Some(rating));
                 assert!(matches!(secs, 86_400 | 259_200), "rating {rating}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_band_is_inside_the_trust_window() {
+        for rating in 0..=99i16 {
+            for version in ["base", "tots", "icon"] {
+                assert!(
+                    poll_interval_seconds(version, Some(rating)) < TRUSTED_PRICE_MAX_AGE_SECONDS,
+                    "rating {rating} is polled less often than it is trusted"
+                );
             }
         }
     }

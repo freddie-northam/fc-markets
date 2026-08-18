@@ -19,3 +19,18 @@
 
 pub mod cohort;
 pub mod valuation;
+
+use crate::domain::TRUSTED_PRICE_MAX_AGE_SECONDS;
+
+/// How old a price may be before a derivation stops trusting it, as the
+/// interval the SQL takes.
+///
+/// Read from `domain`, so the window and the polling bands it must exceed have
+/// one definition and a test asserting the relationship between them.
+pub(crate) fn trust_window() -> sqlx::postgres::types::PgInterval {
+    sqlx::postgres::types::PgInterval {
+        months: 0,
+        days: 0,
+        microseconds: i64::from(TRUSTED_PRICE_MAX_AGE_SECONDS) * 1_000_000,
+    }
+}

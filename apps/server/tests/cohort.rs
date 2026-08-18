@@ -498,3 +498,45 @@ async fn a_price_imported_after_the_moment_is_not_used_at_that_moment() {
     );
     db.cleanup().await;
 }
+
+/// The tier expression and the trust window both answer "how stale is too
+/// stale", in two places, and they must not meet.
+///
+/// The slowest tier polls every 72 hours. The trust window was also 72 hours, so
+/// an asset became DUE at the exact moment it stopped being trusted. 73% of the
+/// catalogue sits in that tier, and any delay at all dropped them out of every
+/// derivation while they waited for a poll that was only just overdue.
+#[tokio::test]
+async fn an_asset_at_the_slowest_tier_is_still_trusted_when_it_falls_due() {
+    let db = TestDb::new().await.unwrap();
+    let market = db.market(PS).await.unwrap();
+    let slowest_hours = (fc_market::domain::poll_interval_seconds("base", Some(50)) / 3600) as i64;
+
+    seed_member(
+        &db,
+        market,
+        Member {
+            name: "Slow Tier",
+            rating: 50,
+            price: 400,
+            // Just past due for its own tier, which is entirely normal: the
+            // budget decides when a due asset is actually read.
+            polled_hours_ago: slowest_hours + 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = cohort::snapshot(&db.pool, market, Utc::now())
+        .await
+        .unwrap();
+    assert!(
+        rows.iter().any(|r| r.rating_band == "under-75"),
+        "an asset {}h old at a {}h tier must still be trusted; it is overdue, \
+         not unknown: {rows:?}",
+        slowest_hours + 2,
+        slowest_hours
+    );
+    db.cleanup().await;
+}
