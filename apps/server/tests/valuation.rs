@@ -4,8 +4,8 @@ mod common;
 
 use chrono::{Duration, Utc};
 use common::*;
+use fc_market::analytics::valuation::{self, ClassValue};
 use fc_market::ids::{MarketId, Platform};
-use fc_market::valuation::{self, ClassValue};
 
 /// A live asset: polled recently, with no failures, holding one price.
 async fn live_card(
@@ -39,7 +39,7 @@ async fn live_card(
 }
 
 async fn value(db: &TestDb, market: MarketId) -> Vec<ClassValue> {
-    valuation::class_median(&db.pool, market, 5_000)
+    valuation::class_median(&db.pool, market, 5_000, Utc::now())
         .await
         .unwrap()
 }
@@ -248,9 +248,13 @@ async fn an_asset_with_failing_polls_is_excluded_and_its_price_leaves_the_median
     db.cleanup().await;
 }
 
-/// An asset that has not been polled for days is equally excluded. The gate is
-/// the poll state, and staleness there is exactly the ambiguity section 4.3
-/// exists to resolve.
+/// An asset we have stopped reading is equally excluded. Staleness here is
+/// exactly the ambiguity section 4.3 exists to resolve: an old price either held
+/// or was never re-read, and only the poll record can tell them apart.
+///
+/// The age is derived from the trust window rather than written as a number, so
+/// widening the window cannot silently turn this test into one that asserts
+/// nothing.
 #[tokio::test]
 async fn an_asset_that_has_not_been_polled_for_days_is_excluded() {
     let db = TestDb::new().await.unwrap();
@@ -260,21 +264,19 @@ async fn an_asset_that_has_not_been_polled_for_days_is_excluded() {
     let asset = seed_asset(&db.pool, game.id, "Forgotten", 84, "base")
         .await
         .unwrap();
-    seed_poll_state(
-        &db.pool,
-        asset,
-        market,
-        0,
-        Some(Utc::now() - Duration::days(5)),
-    )
-    .await
-    .unwrap();
+    // Comfortably beyond the window, whatever the window currently is.
+    let forgotten = Utc::now()
+        - Duration::seconds(i64::from(fc_market::domain::TRUSTED_PRICE_MAX_AGE_SECONDS))
+        - Duration::hours(1);
+    seed_poll_state(&db.pool, asset, market, 0, Some(forgotten))
+        .await
+        .unwrap();
     seed_observation(
         &db.pool,
         asset,
         market,
         "test",
-        Utc::now() - Duration::days(5),
+        forgotten,
         12_000,
         Some(200),
     )

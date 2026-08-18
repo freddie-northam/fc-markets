@@ -1,5 +1,7 @@
+use super::trust_window;
 use crate::ids::MarketId;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -22,12 +24,12 @@ pub struct ClassValue {
 /// The class median. Every clause below answers a specific way this can lie.
 ///
 /// Which prices are trustworthy is NOT decided here. That lives in the
-/// `trusted_latest_prices` view, because the cohort index needs the same answer
+/// `trusted_latest_prices`, because the cohort index needs the same answer
 /// and two definitions of trust would drift apart in silence.
 pub const CLASS_MEDIAN_SQL: &str = r#"
 WITH latest AS (
     SELECT asset_id, price, observed_at, min_price, at_floor
-    FROM trusted_latest_prices
+    FROM trusted_latest_prices($3, $4)
     WHERE market_id = $1
 ),
 buckets AS (
@@ -64,10 +66,22 @@ ORDER BY at_floor, value_ratio NULLS LAST, a.name, a.id
 LIMIT $2
 "#;
 
-pub async fn class_median(pool: &PgPool, market: MarketId, limit: i64) -> Result<Vec<ClassValue>> {
+/// The class median as of a stated time.
+///
+/// `as_of` is a parameter and not `now()` so the same question always returns
+/// the same answer. A ranking that shifts under a prediction cannot be used to
+/// score it.
+pub async fn class_median(
+    pool: &PgPool,
+    market: MarketId,
+    limit: i64,
+    as_of: DateTime<Utc>,
+) -> Result<Vec<ClassValue>> {
     Ok(sqlx::query_as::<_, ClassValue>(CLASS_MEDIAN_SQL)
         .bind(market.0)
         .bind(limit)
+        .bind(as_of)
+        .bind(trust_window())
         .fetch_all(pool)
         .await?)
 }

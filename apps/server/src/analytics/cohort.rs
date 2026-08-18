@@ -14,8 +14,10 @@
 //! the most damage: an unchanged illiquid price reads as a calm market rather
 //! than an absent one.
 
+use super::trust_window;
 use crate::ids::MarketId;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -58,8 +60,10 @@ SELECT t.market_id,
        -- Cast, because sum() over bigint returns NUMERIC and sqlx will not
        -- decode that into i64. The same trap as EXTRACT(EPOCH ...) below.
        (sum(t.price) FILTER (WHERE NOT t.at_floor))::bigint AS total_price,
-       max(EXTRACT(EPOCH FROM (now() - t.observed_at))::float8) / 3600.0 AS stalest_hours
-FROM trusted_latest_prices t
+       -- Measured from as_of, not from now, or a band's staleness would
+       -- change every time the same past question was asked.
+       max(EXTRACT(EPOCH FROM ($2 - t.observed_at))::float8) / 3600.0 AS stalest_hours
+FROM trusted_latest_prices($2, $3) t
 JOIN assets a ON a.id = t.asset_id
 WHERE t.market_id = $1
 GROUP BY t.market_id, a.version, rating_band(a.rating)
@@ -68,9 +72,16 @@ GROUP BY t.market_id, a.version, rating_band(a.rating)
 ORDER BY members DESC, a.version, rating_band(a.rating)
 "#;
 
-pub async fn snapshot(pool: &PgPool, market: MarketId) -> Result<Vec<CohortSnapshot>> {
+/// Every cohort in one market, as of a stated time.
+pub async fn snapshot(
+    pool: &PgPool,
+    market: MarketId,
+    as_of: DateTime<Utc>,
+) -> Result<Vec<CohortSnapshot>> {
     Ok(sqlx::query_as::<_, CohortSnapshot>(COHORT_SNAPSHOT_SQL)
         .bind(market.0)
+        .bind(as_of)
+        .bind(trust_window())
         .fetch_all(pool)
         .await?)
 }

@@ -1,8 +1,7 @@
-use crate::cohort;
+use crate::analytics::{cohort, valuation};
 use crate::config::Config;
 use crate::db;
 use crate::ids::MarketId;
-use crate::valuation;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -243,7 +242,10 @@ async fn valuations(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<valuation::ClassValue>>, ApiError> {
-    let rows = valuation::class_median(&s.pool, MarketId(id), s.config.api_row_cap).await?;
+    // The request's own instant, named rather than reached for inside the
+    // query, so the same call can be replayed against a past time.
+    let rows =
+        valuation::class_median(&s.pool, MarketId(id), s.config.api_row_cap, Utc::now()).await?;
     Ok(Json(rows))
 }
 
@@ -253,7 +255,9 @@ async fn cohorts(
     State(s): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<cohort::CohortSnapshot>>, ApiError> {
-    Ok(Json(cohort::snapshot(&s.pool, MarketId(id)).await?))
+    Ok(Json(
+        cohort::snapshot(&s.pool, MarketId(id), Utc::now()).await?,
+    ))
 }
 
 pub enum ApiError {
