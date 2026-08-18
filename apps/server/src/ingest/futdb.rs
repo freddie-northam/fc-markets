@@ -11,7 +11,9 @@
 use crate::archive::Envelope;
 use crate::domain::{AssetAttributes, Rarity, canonical_version};
 use crate::ids::Platform;
-use crate::source::{FetchError, FetchResult, Listing, ParsedQuote, Source};
+use crate::source::{
+    FetchError, FetchResult, Listing, ParsedQuote, ReferenceEntity, ReferenceKind, Source,
+};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -96,6 +98,17 @@ struct Pagination {
 #[derive(Debug, Deserialize)]
 struct PlayerResponse {
     player: Option<PlayerModel>,
+}
+
+/// Leagues, nations and clubs in one shape. Each list uses the fields it has:
+/// a club belongs to a league, a league to a nation, a nation to nothing.
+#[derive(Debug, Deserialize)]
+struct ReferenceModel {
+    id: i32,
+    name: Option<String>,
+    league: Option<i32>,
+    #[serde(rename = "nationId")]
+    nation_id: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,7 +375,7 @@ impl Source for FutdbSource {
             .collect())
     }
 
-    fn next_asset_list_page(&self, envelope: &Envelope) -> Option<u32> {
+    fn next_page(&self, envelope: &Envelope) -> Option<u32> {
         let parsed: Paged<PlayerModel> = serde_json::from_value(envelope.body.clone()).ok()?;
         let p = parsed.pagination?;
         let (current, total) = (p.page_current?, p.page_total?);
@@ -376,6 +389,48 @@ impl Source for FutdbSource {
             .players(envelope)?
             .into_iter()
             .map(|p| self.attributes_from(p))
+            .collect())
+    }
+
+    fn reference_kinds(&self) -> &'static [ReferenceKind] {
+        &[
+            ReferenceKind::League,
+            ReferenceKind::Nation,
+            ReferenceKind::Club,
+        ]
+    }
+
+    async fn fetch_reference(&self, kind: ReferenceKind, page: u32) -> FetchResult {
+        self.get(&format!("/api/{}s?page={page}", kind.as_str()), Vec::new())
+            .await
+    }
+
+    /// One parser for three lists. Which field names the parent is the only
+    /// difference between them, and a nation has no parent at all.
+    fn parse_reference(
+        &self,
+        kind: ReferenceKind,
+        envelope: &Envelope,
+    ) -> Result<Vec<ReferenceEntity>> {
+        let parsed: Paged<ReferenceModel> = serde_json::from_value(envelope.body.clone())?;
+        Ok(parsed
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                // A row with no name names nothing. Storing it would put an empty
+                // label in front of a human, and the CHECK would reject it anyway.
+                let name = r.name.filter(|n| !n.trim().is_empty())?;
+                Some(ReferenceEntity {
+                    external_id: r.id,
+                    name,
+                    parent_id: match kind {
+                        ReferenceKind::Club => r.league,
+                        ReferenceKind::League => r.nation_id,
+                        ReferenceKind::Nation => None,
+                    },
+                })
+            })
             .collect())
     }
 
@@ -631,18 +686,9 @@ mod tests {
     #[test]
     fn the_list_walk_advances_until_the_provider_says_it_is_done() {
         let s = source();
-        assert_eq!(
-            s.next_asset_list_page(&list_envelope(list_body(1, 5, 0))),
-            Some(2)
-        );
-        assert_eq!(
-            s.next_asset_list_page(&list_envelope(list_body(4, 5, 0))),
-            Some(5)
-        );
-        assert_eq!(
-            s.next_asset_list_page(&list_envelope(list_body(5, 5, 0))),
-            None
-        );
+        assert_eq!(s.next_page(&list_envelope(list_body(1, 5, 0))), Some(2));
+        assert_eq!(s.next_page(&list_envelope(list_body(4, 5, 0))), Some(5));
+        assert_eq!(s.next_page(&list_envelope(list_body(5, 5, 0))), None);
     }
 
     /// A page without pagination must end the walk. Some(1) would loop until
@@ -650,7 +696,7 @@ mod tests {
     #[test]
     fn a_response_without_pagination_ends_the_walk() {
         let body = serde_json::json!({ "items": [] });
-        assert_eq!(source().next_asset_list_page(&list_envelope(body)), None);
+        assert_eq!(source().next_page(&list_envelope(body)), None);
     }
 
     /// Rule 1 compares the name one path writes against the name the other holds.

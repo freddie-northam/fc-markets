@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod drift;
 pub mod fixture;
 pub mod futdb;
+pub mod reference;
 
 use crate::archive::{Archive, Envelope, Kind, object_key};
 use crate::config::Config;
@@ -323,6 +324,9 @@ async fn execute(
     // valuation input whatever its price history holds.
     discovery::maybe_discover(runner, game, run, budget, tally).await?;
     discovery::maybe_refresh_metadata(runner, game, run, budget, tally).await?;
+    // The names behind an asset's league, nation and club identifiers. Monthly,
+    // and after discovery, so it describes assets this run may have just created.
+    reference::maybe_refresh(runner, game, run, budget, tally).await?;
     // Coverage runs after the metadata step, so the tier expression reads the
     // ratings this run just learned rather than last week's.
     discovery::apply_coverage(runner, game).await?;

@@ -21,7 +21,9 @@ use fc_market::ingest::Runner;
 /// The two platforms, defined once for every test file.
 pub const PS: Platform = Platform::Playstation;
 pub const PC: Platform = Platform::Pc;
-use fc_market::source::{FetchError, FetchResult, Listing, ParsedQuote, Source};
+use fc_market::source::{
+    FetchError, FetchResult, Listing, ParsedQuote, ReferenceEntity, ReferenceKind, Source,
+};
 use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -223,6 +225,7 @@ pub fn test_config() -> Config {
         // Zero so that every run performs both slow steps. A test that had to
         // wait a day for discovery would test nothing.
         discovery_cadence_seconds: 0,
+        reference_cadence_seconds: 2_592_000,
         metadata_cadence_seconds: 0,
         fixture_dir: String::new(),
         ingest_interval_seconds: 900,
@@ -550,6 +553,39 @@ impl Source for TestSource {
             return Err(FetchError::RateLimited);
         }
         Ok(self.envelope("test://assets", Vec::new()))
+    }
+
+    fn reference_kinds(&self) -> &'static [ReferenceKind] {
+        &[ReferenceKind::League, ReferenceKind::Nation]
+    }
+
+    async fn fetch_reference(&self, _kind: ReferenceKind, _page: u32) -> FetchResult {
+        if self.is_rate_limited() {
+            return Err(FetchError::RateLimited);
+        }
+        Ok(self.envelope("test://reference", Vec::new()))
+    }
+
+    /// One page, two rows, so a test can assert names land and parents differ by
+    /// kind without a paginated fake.
+    fn parse_reference(
+        &self,
+        kind: ReferenceKind,
+        _envelope: &Envelope,
+    ) -> Result<Vec<ReferenceEntity>> {
+        Ok(match kind {
+            ReferenceKind::League => vec![ReferenceEntity {
+                external_id: 13,
+                name: "Premier League".into(),
+                parent_id: Some(14),
+            }],
+            ReferenceKind::Nation => vec![ReferenceEntity {
+                external_id: 14,
+                name: "England".into(),
+                parent_id: None,
+            }],
+            ReferenceKind::Club => Vec::new(),
+        })
     }
 
     fn parse_asset_list(&self, _envelope: &Envelope) -> Result<Vec<Listing>> {

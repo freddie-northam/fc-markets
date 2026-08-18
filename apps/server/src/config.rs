@@ -68,6 +68,10 @@ pub struct Config {
     pub asset_coverage: i64,
     pub discovery_cadence_seconds: i64,
     pub metadata_cadence_seconds: i64,
+    /// How often the reference lists are re-walked. Monthly by default: they are
+    /// static between titles, so a daily walk would spend 75 requests a day to
+    /// learn nothing.
+    pub reference_cadence_seconds: i64,
     /// Where the fixture source reads its payloads from. A real provider replaces
     /// the source module and ignores this.
     pub fixture_dir: String,
@@ -115,6 +119,7 @@ impl Config {
             asset_coverage: num("ASSET_COVERAGE", 40_000)?,
             discovery_cadence_seconds: num("DISCOVERY_CADENCE_SECONDS", 86_400)?,
             metadata_cadence_seconds: num("METADATA_CADENCE_SECONDS", 604_800)?,
+            reference_cadence_seconds: num("REFERENCE_CADENCE_SECONDS", 2_592_000)?,
             fixture_dir: opt("FIXTURE_DIR", "fixtures/fixture"),
             ingest_interval_seconds: num("INGEST_INTERVAL_SECONDS", 900)?,
             pg_dump_path: opt("PG_DUMP_PATH", "pg_dump"),

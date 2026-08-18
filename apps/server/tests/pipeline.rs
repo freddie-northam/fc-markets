@@ -1361,8 +1361,9 @@ async fn every_request_is_counted_exactly_once() {
 
     assert_eq!(
         db::requests_spent_today(&db.pool, "test").await.unwrap(),
-        3,
-        "the asset list, the metadata batch and the price batch, once each"
+        5,
+        "the asset list, the metadata batch, the league and nation reference \
+         pages, and the price batch, once each"
     );
     db.cleanup().await;
 }
@@ -1674,6 +1675,106 @@ async fn compression_covers_every_column_of_the_idempotency_indexes() {
     assert_eq!(
         checked, 2,
         "both fact tables must have a unique index to check"
+    );
+    db.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Reference lists
+// ---------------------------------------------------------------------------
+
+/// An asset stores league_id, nation_id and club_id as bare integers. Without
+/// these lists a card knows it belongs to league 13 and cannot say Premier
+/// League, which blocks every human readable label and every cohort cut by
+/// league or nation.
+#[tokio::test]
+async fn the_reference_lists_give_the_identifiers_names() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 3)]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let rows: Vec<(String, i32, String, Option<i32>)> = sqlx::query_as(
+        "SELECT kind, external_id, name, parent_id FROM reference_entities ORDER BY kind",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 2, "one league and one nation: {rows:?}");
+    let league = rows.iter().find(|r| r.0 == "league").unwrap();
+    assert_eq!(league.2, "Premier League");
+    assert_eq!(
+        league.3,
+        Some(14),
+        "a league belongs to a nation, and the parent must carry that"
+    );
+    let nation = rows.iter().find(|r| r.0 == "nation").unwrap();
+    assert_eq!(nation.2, "England");
+    assert_eq!(nation.3, None, "a nation belongs to nothing");
+    db.cleanup().await;
+}
+
+/// The lists are static between titles, so a daily walk would spend seventy five
+/// requests a day to learn nothing. Re-running inside the cadence must not spend
+/// a single request.
+#[tokio::test]
+async fn the_reference_lists_are_not_re_walked_inside_their_cadence() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 3)]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let first: i64 = db
+        .count("SELECT coalesce(sum((metadata->>'requests')::bigint), 0)::bigint FROM ingest_runs")
+        .await;
+    make_everything_due(&db.pool).await.unwrap();
+    run_once(&db, &source, &archive).await.unwrap();
+    let second: i64 = db
+        .count("SELECT coalesce(sum((metadata->>'requests')::bigint), 0)::bigint FROM ingest_runs")
+        .await;
+
+    // The price path still runs, so the total rises. What must not rise is the
+    // reference row count, which would mean the lists were walked again.
+    assert_eq!(
+        db.count("SELECT count(*) FROM reference_entities").await,
+        2,
+        "a second walk inside the cadence would rewrite the same rows"
+    );
+    assert!(second > first, "the price path still spent requests");
+    db.cleanup().await;
+}
+
+/// The provider renumbers between titles exactly as it does for assets, so one
+/// key per game is what stops next season's league 13 overwriting this one.
+///
+/// The step's cadence is per source rather than per game, as discovery's is, so
+/// a second game inside the same window is not walked. What must hold regardless
+/// is that the KEY leaves room for it.
+#[tokio::test]
+async fn one_league_id_in_two_games_is_two_rows() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![Card::new("101", "Marco Verratti").recent(9_000, 3)]);
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let (next_game, _) = seed_second_game(&db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO reference_entities (source, game_id, kind, external_id, name)
+         VALUES ('test', $1, 'league', 13, 'Premier League')",
+    )
+    .bind(next_game.0)
+    .execute(&db.pool)
+    .await
+    .expect("the same league id in another game must not collide");
+
+    assert_eq!(
+        db.count(
+            "SELECT count(*) FROM reference_entities WHERE kind = 'league' AND external_id = 13"
+        )
+        .await,
+        2,
+        "one identifier, two games, two names"
     );
     db.cleanup().await;
 }
