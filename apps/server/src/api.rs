@@ -1,4 +1,4 @@
-use crate::analytics::{cohort, valuation};
+use crate::analytics::{cohort, events, valuation};
 use crate::config::Config;
 use crate::db;
 use crate::ids::MarketId;
@@ -29,6 +29,7 @@ pub fn router(pool: PgPool, config: Config) -> Router {
         .route("/assets/{id}/prices", get(asset_prices))
         .route("/markets/{id}/valuations", get(valuations))
         .route("/markets/{id}/cohorts", get(cohorts))
+        .route("/events", get(list_events))
         .with_state(state)
 }
 
@@ -247,6 +248,19 @@ async fn valuations(
     let rows =
         valuation::class_median(&s.pool, MarketId(id), s.config.api_row_cap, Utc::now()).await?;
     Ok(Json(rows))
+}
+
+/// Events the ledger knows about now.
+///
+/// Read only, like every other route here. Recording is a CLI command instead:
+/// this API has no authentication, so it is served on a private network only,
+/// and an unauthenticated write endpoint is a different risk from an
+/// unauthenticated read. An operator records an event, not an application.
+async fn list_events(
+    State(s): State<AppState>,
+) -> Result<Json<Vec<events::MarketEvent>>, ApiError> {
+    let game = db::game_by_code(&s.pool, &s.config.game_code).await?;
+    Ok(Json(events::known_at(&s.pool, game.id, Utc::now()).await?))
 }
 
 /// No row cap. There are two versions times seven bands at most, so the result

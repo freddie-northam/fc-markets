@@ -144,8 +144,7 @@ pub const TRUSTED_PRICE_MAX_AGE_SECONDS: i32 = 2 * SLOWEST_POLL_INTERVAL_SECONDS
 // margin must be a full cycle: an asset falls due at the end of its band and the
 // budget decides when a due asset is actually read, so overdue is normal.
 const _: () = assert!(
-    TRUSTED_PRICE_MAX_AGE_SECONDS - SLOWEST_POLL_INTERVAL_SECONDS
-        >= SLOWEST_POLL_INTERVAL_SECONDS,
+    TRUSTED_PRICE_MAX_AGE_SECONDS - SLOWEST_POLL_INTERVAL_SECONDS >= SLOWEST_POLL_INTERVAL_SECONDS,
     "the trust window must exceed the slowest polling band by a full cycle"
 );
 

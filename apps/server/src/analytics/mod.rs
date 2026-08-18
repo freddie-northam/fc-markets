@@ -18,6 +18,7 @@
 //! present and never the past.
 
 pub mod cohort;
+pub mod events;
 pub mod valuation;
 
 use crate::domain::TRUSTED_PRICE_MAX_AGE_SECONDS;

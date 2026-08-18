@@ -35,6 +35,30 @@ enum Command {
     Ingest,
     /// Serve the API and run ingestion on an interval.
     Serve,
+    /// Record something the game did, so a price move can be attributed to it.
+    ///
+    /// A command rather than an endpoint: the API has no authentication, and an
+    /// unauthenticated write is a different risk from an unauthenticated read.
+    /// An operator records an event; an application does not.
+    Event {
+        /// What kind of thing happened, for example content-drop or promo-start.
+        #[arg(long)]
+        kind: String,
+        /// The promotion or release, as EA named it.
+        #[arg(long)]
+        name: String,
+        /// When it happened in the game, RFC 3339. Never our clock.
+        #[arg(long)]
+        at: chrono::DateTime<chrono::Utc>,
+        /// When it ended, if it has.
+        #[arg(long)]
+        ended: Option<chrono::DateTime<chrono::Utc>>,
+        #[arg(long)]
+        note: Option<String>,
+        /// The event this corrects. A correction is a new row, never an edit.
+        #[arg(long)]
+        supersedes: Option<uuid::Uuid>,
+    },
     /// Write one database dump to the archive bucket and stop.
     Backup,
     /// Re-parse one run's archived payloads under the current parser.
@@ -92,6 +116,33 @@ async fn main() -> Result<()> {
                 deleted = report.deleted,
                 rewritten = report.rewritten,
                 "replay finished"
+            );
+        }
+        Command::Event {
+            kind,
+            name,
+            at,
+            ended,
+            note,
+            supersedes,
+        } => {
+            let game = db::game_by_code(&pool, &config.game_code).await?;
+            let saved = fc_market::analytics::events::record(
+                &pool,
+                game.id,
+                &fc_market::analytics::events::NewEvent {
+                    kind,
+                    name,
+                    occurred_at: at,
+                    ended_at: ended,
+                    note,
+                    supersedes,
+                },
+            )
+            .await?;
+            tracing::info!(
+                id = %saved.id, kind = %saved.kind, name = %saved.name,
+                occurred_at = %saved.occurred_at, "event recorded"
             );
         }
         Command::Serve => serve(pool, config).await?,
