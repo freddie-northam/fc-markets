@@ -839,6 +839,33 @@ async fn link_player(
 // Health
 // ---------------------------------------------------------------------------
 
+/// The highest identifier we hold for a source, for asking a provider what it
+/// has added since.
+///
+/// Computed rather than stored, so it cannot drift from the assets it describes:
+/// a stored watermark survives a restore that the rows did not, and then hides
+/// everything between the two.
+///
+/// Identifiers are text because that is what a provider gives us, so the compare
+/// has to be numeric or "9" would outrank "56022". Anything non numeric is
+/// skipped rather than failing the query: one odd identifier must not stop
+/// discovery, and the full walk sees those anyway.
+pub async fn highest_external_id(
+    pool: &PgPool,
+    source: &str,
+    game: GameId,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT max(external_id::bigint)::text
+           FROM asset_source_ids
+          WHERE source = $1 AND game_id = $2 AND external_id ~ '^[0-9]+$'",
+    )
+    .bind(source)
+    .bind(game.0)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Writes a reference list page, and reports how many rows changed.
 ///
 /// One statement for all three lists: they differ only in `kind`, so a per-list

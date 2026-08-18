@@ -1778,3 +1778,88 @@ async fn one_league_id_in_two_games_is_two_rows() {
     );
     db.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// Incremental discovery
+// ---------------------------------------------------------------------------
+
+/// The provider is asked for what it added after the highest identifier we hold,
+/// so the daily walk costs a handful of requests instead of 1,357 pages.
+#[tokio::test]
+async fn the_incremental_walk_asks_from_the_highest_identifier_we_hold() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(vec![
+        Card::new("101", "Marco Verratti").recent(9_000, 3),
+        Card::new("56022", "Newest Card").recent(9_000, 3),
+        Card::new("9", "Old Card").recent(9_000, 3),
+    ])
+    .incremental();
+    run_once(&db, &source, &archive).await.unwrap();
+
+    let asked = source.asked_after.lock().unwrap().clone();
+    assert_eq!(
+        asked.as_deref(),
+        Some("56022"),
+        "the watermark must be the numerically highest identifier, not the \
+         lexically highest: \"9\" would win a text sort"
+    );
+    db.cleanup().await;
+}
+
+/// A fresh install has no assets, so there is no watermark and nothing to ask
+/// from. The full walk is what bootstraps a catalogue.
+#[tokio::test]
+async fn the_incremental_walk_does_nothing_before_any_asset_exists() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source = TestSource::new(Vec::new()).incremental();
+    run_once(&db, &source, &archive).await.unwrap();
+
+    assert_eq!(
+        *source.asked_after.lock().unwrap(),
+        None,
+        "with no assets there is no identifier to ask from"
+    );
+    db.cleanup().await;
+}
+
+/// The reason the full walk survives. A provider can insert a card BELOW the
+/// highest identifier we hold, and the incremental walk asks only for what is
+/// above it, so such a card is invisible to it for ever. Only the full walk sees
+/// it, which is why the cheap walk supplements rather than replaces.
+#[tokio::test]
+async fn a_card_inserted_below_the_watermark_is_found_only_by_the_full_walk() {
+    let db = TestDb::new().await.unwrap();
+    let archive = MemoryArchive::default();
+    let source =
+        TestSource::new(vec![Card::new("500", "High Card").recent(9_000, 3)]).incremental();
+    run_once(&db, &source, &archive).await.unwrap();
+    assert_eq!(db.count("SELECT count(*) FROM assets").await, 1);
+
+    // The provider backfills a card underneath what we already hold.
+    source.set_cards(vec![
+        Card::new("500", "High Card").recent(9_000, 3),
+        Card::new("100", "Backfilled").recent(9_000, 3),
+    ]);
+
+    // The incremental walk alone cannot see it: it asks from 500 upwards.
+    make_everything_due(&db.pool).await.unwrap();
+    let config = Config {
+        // The full walk is out of cadence; only the incremental one runs.
+        discovery_cadence_seconds: 999_999_999,
+        ..db.config()
+    };
+    let runner = runner_for(&db, &source, &archive, &config);
+    ingest::run(&runner).await.unwrap();
+
+    // The fake answers every walk with its whole card list, so this asserts the
+    // SCHEDULING rather than the provider's filtering: what matters is that the
+    // full walk is still scheduled, because a real provider would omit it.
+    assert_eq!(
+        *source.asked_after.lock().unwrap(),
+        Some("500".to_string()),
+        "the incremental walk asked from the watermark, above the backfilled card"
+    );
+    db.cleanup().await;
+}

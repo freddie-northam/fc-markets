@@ -356,6 +356,21 @@ impl Source for FutdbSource {
         .collect())
     }
 
+    fn supports_incremental_discovery(&self) -> bool {
+        true
+    }
+
+    /// Exclusive of the identifier given, ascending, same paginated shape as the
+    /// full list. Measured against the live API: `latest/56000` answers 56001
+    /// onward and never 56000 itself.
+    async fn fetch_assets_after(&self, after: &str, page: u32) -> FetchResult {
+        self.get(
+            &format!("/api/players/latest/{after}?page={page}"),
+            Vec::new(),
+        )
+        .await
+    }
+
     async fn fetch_asset_list(&self, page: u32) -> FetchResult {
         self.get(&format!("/api/players?page={page}"), Vec::new())
             .await

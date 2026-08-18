@@ -224,6 +224,7 @@ pub fn test_config() -> Config {
         asset_coverage: 600,
         // Zero so that every run performs both slow steps. A test that had to
         // wait a day for discovery would test nothing.
+        new_assets_cadence_seconds: 86_400,
         discovery_cadence_seconds: 0,
         reference_cadence_seconds: 2_592_000,
         metadata_cadence_seconds: 0,
@@ -432,6 +433,11 @@ pub struct TestSource {
     rate_limited: AtomicBool,
     pub batch_size: usize,
     pub price_requests: Mutex<Vec<Vec<String>>>,
+    /// Off by default, so every existing test keeps walking the whole list.
+    incremental: bool,
+    /// The watermark the incremental walk asked for, recorded so a test can
+    /// assert it rather than infer it.
+    pub asked_after: Mutex<Option<String>>,
 }
 
 impl TestSource {
@@ -443,6 +449,8 @@ impl TestSource {
             rate_limited: AtomicBool::new(false),
             batch_size: 50,
             price_requests: Mutex::new(Vec::new()),
+            incremental: false,
+            asked_after: Mutex::new(None),
         }
     }
 
@@ -460,6 +468,12 @@ impl TestSource {
 
     fn is_rate_limited(&self) -> bool {
         self.rate_limited.load(Ordering::SeqCst)
+    }
+
+    /// Turns on the incremental walk for this source.
+    pub fn incremental(mut self) -> Self {
+        self.incremental = true;
+        self
     }
 
     pub fn batch_size(mut self, size: usize) -> Self {
@@ -546,6 +560,20 @@ impl Source for TestSource {
             }
         }
         Ok(out)
+    }
+
+    fn supports_incremental_discovery(&self) -> bool {
+        self.incremental
+    }
+
+    /// Records what it was asked for, so a test can assert the watermark, and
+    /// answers with only the cards above it.
+    async fn fetch_assets_after(&self, after: &str, _page: u32) -> FetchResult {
+        if self.is_rate_limited() {
+            return Err(FetchError::RateLimited);
+        }
+        *self.asked_after.lock().unwrap() = Some(after.to_string());
+        Ok(self.envelope("test://assets-after", vec![after.to_string()]))
     }
 
     async fn fetch_asset_list(&self, _page: u32) -> FetchResult {

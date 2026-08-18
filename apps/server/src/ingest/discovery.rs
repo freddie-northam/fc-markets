@@ -19,6 +19,7 @@ use tracing::{info, warn};
 /// Recorded in `ingest_runs.metadata` so the next run can tell how long ago each
 /// slow step last ran, without a table of its own.
 const DISCOVERY_STEP: &str = "discovery_ran";
+const NEW_ASSETS_STEP: &str = "new_assets_ran";
 const METADATA_STEP: &str = "metadata_ran";
 
 /// A hard stop on the asset list walk. The budget bounds it only at thousands
@@ -65,12 +66,40 @@ async fn apply_attributes(
     Ok((updated, repointed))
 }
 
+/// Which walk to run.
+///
+/// The two differ only in what they ask the provider for. Everything after the
+/// fetch, archiving, parsing, inserting and harvesting attributes, is identical,
+/// so it lives once below.
+#[derive(Clone, Copy)]
+enum Walk<'a> {
+    /// Every page of the catalogue.
+    Whole,
+    /// Only what the provider added after this identifier.
+    After(&'a str),
+}
+
+impl Walk<'_> {
+    fn what(&self) -> &'static str {
+        match self {
+            Self::Whole => "the asset list",
+            Self::After(_) => "the new asset list",
+        }
+    }
+}
+
 /// Enumerates the source's full asset list and records identifiers we have not
 /// seen.
 ///
 /// It deliberately keeps no highest-identifier watermark. A provider can
 /// renumber or backfill its records, and a watermark would make every backfilled
 /// card invisible for ever.
+///
+/// That is why `maybe_discover_new` does NOT replace this. The watermark walk is
+/// fast and frequent and catches new cards within a day; this one is slow and
+/// rare and is the only thing that ever sees a card the provider inserted BELOW
+/// the watermark. Dropping it would trade a permanent blind spot for a saving
+/// this already gets most of.
 pub(crate) async fn maybe_discover(
     runner: &Runner<'_>,
     game: &db::Game,
@@ -89,6 +118,76 @@ pub(crate) async fn maybe_discover(
     {
         return Ok(());
     }
+    walk(
+        runner,
+        game,
+        run,
+        budget,
+        tally,
+        Walk::Whole,
+        DISCOVERY_STEP,
+    )
+    .await
+}
+
+/// Asks the provider only for what it has added since we last looked.
+///
+/// The full walk costs 1,357 pages against a catalogue of 27,121, spends 7.5% of
+/// a day's request budget and is 38% of everything the archive holds, all to find
+/// the handful of cards EA released overnight. This asks for those directly.
+///
+/// It cannot stand alone. See `maybe_discover` for why the full walk remains.
+///
+/// The watermark is the highest identifier we hold, computed rather than stored,
+/// so it cannot drift from the assets it describes. With no assets yet there is
+/// no watermark and nothing to do: the full walk is what bootstraps a catalogue.
+pub(crate) async fn maybe_discover_new(
+    runner: &Runner<'_>,
+    game: &db::Game,
+    run: Run,
+    budget: &mut Budget,
+    tally: &mut Tally,
+) -> Result<()> {
+    if !runner.source.supports_incremental_discovery() {
+        return Ok(());
+    }
+    let source = runner.source.name();
+    if !is_due(
+        runner,
+        source,
+        NEW_ASSETS_STEP,
+        runner.config.new_assets_cadence_seconds,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let Some(watermark) = db::highest_external_id(runner.pool, source, game.id).await? else {
+        return Ok(());
+    };
+    walk(
+        runner,
+        game,
+        run,
+        budget,
+        tally,
+        Walk::After(&watermark),
+        NEW_ASSETS_STEP,
+    )
+    .await
+}
+
+/// One page walk, shared by both.
+async fn walk(
+    runner: &Runner<'_>,
+    game: &db::Game,
+    run: Run,
+    budget: &mut Budget,
+    tally: &mut Tally,
+    what: Walk<'_>,
+    step: &'static str,
+) -> Result<()> {
+    let source = runner.source.name();
     let mut known = db::known_external_ids(runner.pool, source, game.id).await?;
     let mut listed = 0usize;
     let mut added = 0usize;
@@ -97,20 +196,21 @@ pub(crate) async fn maybe_discover(
     let mut pages = 0u32;
     let mut page = 1u32;
     // Only a walk that reached the provider's last page may mark the step done.
-    // The flag suppresses discovery for a whole cadence, so a walk cut short on
+    // The flag suppresses the walk for a whole cadence, so one cut short on
     // budget would hide the rest of the catalogue until tomorrow.
     let mut complete = true;
 
     loop {
         if pages >= MAX_ASSET_LIST_PAGES {
             tally.degrade(format!(
-                "the asset list did not end within {MAX_ASSET_LIST_PAGES} pages"
+                "{} did not end within {MAX_ASSET_LIST_PAGES} pages",
+                what.what()
             ));
             complete = false;
             break;
         }
         if !budget.take() {
-            tally.degrade("the daily request budget stopped asset discovery");
+            tally.degrade(format!("the daily request budget stopped {}", what.what()));
             complete = false;
             break;
         }
@@ -120,16 +220,31 @@ pub(crate) async fn maybe_discover(
         // ABANDON_AFTER before the price loop starts.
         db::touch_heartbeat(runner.pool, run.id).await?;
         // Archive before parse, once per response, so replay sees what we saw.
-        let Fetched::Ready(envelope, _) = fetch_and_archive(
-            runner,
-            tally,
-            run,
-            Kind::AssetList,
-            page as usize,
-            runner.source.fetch_asset_list(page),
-        )
-        .await
-        else {
+        let fetched = match what {
+            Walk::Whole => {
+                fetch_and_archive(
+                    runner,
+                    tally,
+                    run,
+                    Kind::AssetList,
+                    page as usize,
+                    runner.source.fetch_asset_list(page),
+                )
+                .await
+            }
+            Walk::After(after) => {
+                fetch_and_archive(
+                    runner,
+                    tally,
+                    run,
+                    Kind::AssetList,
+                    page as usize,
+                    runner.source.fetch_assets_after(after, page),
+                )
+                .await
+            }
+        };
+        let Fetched::Ready(envelope, _) = fetched else {
             complete = false;
             break;
         };
@@ -141,7 +256,10 @@ pub(crate) async fn maybe_discover(
         let listings = match runner.source.parse_asset_list(&envelope) {
             Ok(listings) => listings,
             Err(e) => {
-                tally.degrade(format!("asset list page {page} could not be parsed: {e}"));
+                tally.degrade(format!(
+                    "{} page {page} could not be parsed: {e}",
+                    what.what()
+                ));
                 complete = false;
                 break;
             }
@@ -176,7 +294,8 @@ pub(crate) async fn maybe_discover(
             }
             Err(e) => {
                 tally.degrade(format!(
-                    "attributes on asset list page {page} could not be parsed: {e}"
+                    "attributes on {} page {page} could not be parsed: {e}",
+                    what.what()
                 ));
                 complete = false;
             }
@@ -188,7 +307,8 @@ pub(crate) async fn maybe_discover(
             Some(next) if next > page => page = next,
             Some(next) => {
                 tally.degrade(format!(
-                    "the asset list asked us to go from page {page} back to {next}"
+                    "{} asked us to go from page {page} back to {next}",
+                    what.what()
                 ));
                 complete = false;
                 break;
@@ -204,12 +324,12 @@ pub(crate) async fn maybe_discover(
     }
 
     if complete {
-        tally.steps.push(DISCOVERY_STEP);
-        db::record_step(runner.pool, run.id, DISCOVERY_STEP).await?;
+        tally.steps.push(step);
+        db::record_step(runner.pool, run.id, step).await?;
     }
     info!(
-        pages,
-        listed, added, attributed, complete, "asset discovery finished"
+        walk = what.what(),
+        pages, listed, added, attributed, complete, "asset discovery finished"
     );
     Ok(())
 }
