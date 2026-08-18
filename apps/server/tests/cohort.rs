@@ -474,14 +474,21 @@ async fn a_price_imported_after_the_moment_is_not_used_at_that_moment() {
     )
     .await
     .unwrap();
-    // Observed 30 hours ago, but only imported a moment ago.
-    sqlx::query("UPDATE market_observations SET ingested_at = now() WHERE asset_id = $1")
+    // Observed 30 hours ago, but only imported at a moment THIS TEST names.
+    //
+    // Not the database's now(): that is transaction start time on another clock,
+    // and comparing it against a client side Utc::now() taken afterwards is a
+    // race the test loses under parallel load. The instant is stated so both
+    // assertions below sit unambiguously either side of it.
+    let imported_at = Utc::now() - Duration::hours(1);
+    sqlx::query("UPDATE market_observations SET ingested_at = $2 WHERE asset_id = $1")
         .bind(asset.0)
+        .bind(imported_at)
         .execute(&db.pool)
         .await
         .unwrap();
 
-    let then = cohort::snapshot(&db.pool, market, Utc::now() - Duration::hours(12))
+    let then = cohort::snapshot(&db.pool, market, imported_at - Duration::hours(11))
         .await
         .unwrap();
     assert!(
@@ -489,12 +496,12 @@ async fn a_price_imported_after_the_moment_is_not_used_at_that_moment() {
         "a price we had not yet imported must not appear in a past answer: {then:?}"
     );
 
-    let now = cohort::snapshot(&db.pool, market, Utc::now())
+    let after = cohort::snapshot(&db.pool, market, imported_at + Duration::minutes(1))
         .await
         .unwrap();
     assert!(
-        now.iter().any(|r| r.rating_band == "90+"),
-        "and it must appear once we have it"
+        after.iter().any(|r| r.rating_band == "90+"),
+        "and it must appear once we have it: {after:?}"
     );
     db.cleanup().await;
 }
