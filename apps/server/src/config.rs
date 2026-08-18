@@ -78,6 +78,15 @@ pub struct Config {
     /// static between titles, so a daily walk would spend 75 requests a day to
     /// learn nothing.
     pub reference_cadence_seconds: i64,
+    /// How often the system records what it currently thinks is cheap. Daily,
+    /// matching the feed: a claim per card per day is the finest granularity the
+    /// data supports.
+    pub prediction_cadence_seconds: i64,
+    /// How long a claim runs before it is scored. Fixed in advance, because a
+    /// horizon chosen after the outcome is known is not a horizon.
+    pub prediction_horizon_seconds: i64,
+    /// How many cards are claimed each day and market.
+    pub predictions_per_market: i64,
     /// Where the fixture source reads its payloads from. A real provider replaces
     /// the source module and ignores this.
     pub fixture_dir: String,
@@ -127,6 +136,9 @@ impl Config {
             new_assets_cadence_seconds: num("NEW_ASSETS_CADENCE_SECONDS", 86_400)?,
             metadata_cadence_seconds: num("METADATA_CADENCE_SECONDS", 604_800)?,
             reference_cadence_seconds: num("REFERENCE_CADENCE_SECONDS", 2_592_000)?,
+            prediction_cadence_seconds: num("PREDICTION_CADENCE_SECONDS", 86_400)?,
+            prediction_horizon_seconds: num("PREDICTION_HORIZON_SECONDS", 604_800)?,
+            predictions_per_market: num("PREDICTIONS_PER_MARKET", 20)?,
             fixture_dir: opt("FIXTURE_DIR", "fixtures/fixture"),
             ingest_interval_seconds: num("INGEST_INTERVAL_SECONDS", 900)?,
             pg_dump_path: opt("PG_DUMP_PATH", "pg_dump"),

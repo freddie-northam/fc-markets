@@ -19,6 +19,7 @@
 
 pub mod cohort;
 pub mod events;
+pub mod predictions;
 pub mod valuation;
 
 use crate::domain::TRUSTED_PRICE_MAX_AGE_SECONDS;

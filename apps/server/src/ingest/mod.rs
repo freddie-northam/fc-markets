@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod drift;
 pub mod fixture;
 pub mod futdb;
+pub mod predict;
 pub mod reference;
 
 use crate::archive::{Archive, Envelope, Kind, object_key};
@@ -335,7 +336,11 @@ async fn execute(
     // ratings this run just learned rather than last week's.
     discovery::apply_coverage(runner, game).await?;
 
-    ingest_prices(runner, game, run, budget, tally).await
+    ingest_prices(runner, game, run, budget, tally).await?;
+
+    // Last, so the claims reason about the prices this run just wrote. It spends
+    // no requests: everything it needs is already in the ledger.
+    predict::maybe_record(runner, game, run, tally).await
 }
 
 async fn ingest_prices(
