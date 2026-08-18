@@ -66,7 +66,13 @@ pub struct Config {
     /// tier bands hold the whole measured catalogue of 27,121 inside 18,000
     /// requests a day, so the default covers it with room for growth.
     pub asset_coverage: i64,
+    /// How often the WHOLE catalogue is walked. Weekly: it costs 1,357 pages
+    /// and exists to catch cards the provider inserted below the watermark,
+    /// which is rare. New cards arrive through the incremental walk instead.
     pub discovery_cadence_seconds: i64,
+    /// How often the provider is asked for what it has added. Daily, and a
+    /// handful of requests.
+    pub new_assets_cadence_seconds: i64,
     pub metadata_cadence_seconds: i64,
     /// How often the reference lists are re-walked. Monthly by default: they are
     /// static between titles, so a daily walk would spend 75 requests a day to
@@ -117,7 +123,8 @@ impl Config {
             bind_address: opt("BIND_ADDRESS", "0.0.0.0:8090"),
             game_code: opt("GAME_CODE", "FC26"),
             asset_coverage: num("ASSET_COVERAGE", 40_000)?,
-            discovery_cadence_seconds: num("DISCOVERY_CADENCE_SECONDS", 86_400)?,
+            discovery_cadence_seconds: num("DISCOVERY_CADENCE_SECONDS", 604_800)?,
+            new_assets_cadence_seconds: num("NEW_ASSETS_CADENCE_SECONDS", 86_400)?,
             metadata_cadence_seconds: num("METADATA_CADENCE_SECONDS", 604_800)?,
             reference_cadence_seconds: num("REFERENCE_CADENCE_SECONDS", 2_592_000)?,
             fixture_dir: opt("FIXTURE_DIR", "fixtures/fixture"),

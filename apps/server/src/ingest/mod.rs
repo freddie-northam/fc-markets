@@ -323,6 +323,10 @@ async fn execute(
     // that is not discovered is never polled, and one with no attributes has no
     // valuation input whatever its price history holds.
     discovery::maybe_discover(runner, game, run, budget, tally).await?;
+    // Cheap and daily, where the full walk is expensive and weekly. It cannot
+    // replace it: a card inserted below the watermark is only ever seen by the
+    // full walk.
+    discovery::maybe_discover_new(runner, game, run, budget, tally).await?;
     discovery::maybe_refresh_metadata(runner, game, run, budget, tally).await?;
     // The names behind an asset's league, nation and club identifiers. Monthly,
     // and after discovery, so it describes assets this run may have just created.

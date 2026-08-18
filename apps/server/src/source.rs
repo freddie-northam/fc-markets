@@ -109,6 +109,24 @@ pub trait Source: Send + Sync {
 
     fn parse_asset_list(&self, envelope: &Envelope) -> anyhow::Result<Vec<Listing>>;
 
+    /// Whether the provider can be asked for only what it has added.
+    ///
+    /// A provider without such an endpoint keeps the default, and the caller
+    /// falls back to walking the whole catalogue.
+    fn supports_incremental_discovery(&self) -> bool {
+        false
+    }
+
+    /// One page of the assets the provider added AFTER this identifier.
+    ///
+    /// The response has the same shape as the asset list, so `parse_asset_list`,
+    /// `parse_asset_list_attributes` and `next_page` all serve it unchanged.
+    async fn fetch_assets_after(&self, _after: &str, _page: u32) -> FetchResult {
+        Err(FetchError::Other(anyhow::anyhow!(
+            "this provider cannot be asked for new assets alone"
+        )))
+    }
+
     /// The next page, read from the response just received. `None` ends the
     /// walk, so a provider that answers whole needs no implementation.
     ///
