@@ -839,6 +839,51 @@ async fn link_player(
 // Health
 // ---------------------------------------------------------------------------
 
+/// Writes a reference list page, and reports how many rows changed.
+///
+/// One statement for all three lists: they differ only in `kind`, so a per-list
+/// upsert would be the same SQL three times waiting to drift.
+pub async fn upsert_reference(
+    pool: &PgPool,
+    source: &str,
+    game: GameId,
+    kind: crate::source::ReferenceKind,
+    rows: &[crate::source::ReferenceEntity],
+) -> Result<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i32> = rows.iter().map(|r| r.external_id).collect();
+    let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+    let parents: Vec<Option<i32>> = rows.iter().map(|r| r.parent_id).collect();
+
+    let done = sqlx::query(
+        r#"INSERT INTO reference_entities
+           (source, game_id, kind, external_id, name, parent_id)
+         SELECT $1, $2, $3, u.id, u.name, u.parent
+           FROM UNNEST($4::int[], $5::text[], $6::int[]) AS u(id, name, parent)
+         ON CONFLICT (source, game_id, kind, external_id) DO UPDATE
+            SET name = EXCLUDED.name,
+                parent_id = EXCLUDED.parent_id,
+                refreshed_at = now()
+          -- Only when something actually changed. Without this every refresh
+          -- rewrites every row, and refreshed_at stops separating "we checked"
+          -- from "it moved", which are different questions.
+          WHERE reference_entities.name IS DISTINCT FROM EXCLUDED.name
+             OR reference_entities.parent_id IS DISTINCT FROM EXCLUDED.parent_id"#,
+    )
+    .bind(source)
+    .bind(game.0)
+    .bind(kind.as_str())
+    .bind(&ids)
+    .bind(&names)
+    .bind(&parents)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(done)
+}
+
 /// How many bytes this database holds on its volume.
 ///
 /// It counts the database and the write ahead log, which are the two things

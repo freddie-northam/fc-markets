@@ -28,6 +28,35 @@ pub struct ParsedQuote {
     pub name: Option<String>,
 }
 
+/// A reference list the provider publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceKind {
+    League,
+    Nation,
+    Club,
+}
+
+impl ReferenceKind {
+    /// The stored value. Matches the CHECK on `reference_entities.kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::League => "league",
+            Self::Nation => "nation",
+            Self::Club => "club",
+        }
+    }
+}
+
+/// One row of a reference list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceEntity {
+    pub external_id: i32,
+    pub name: String,
+    /// What it belongs to: a club's league, a league's nation. None for a
+    /// nation, and None when the provider omits it.
+    pub parent_id: Option<i32>,
+}
+
 /// One entry of the provider's asset list. Discovery needs nothing more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
@@ -82,8 +111,36 @@ pub trait Source: Send + Sync {
 
     /// The next page, read from the response just received. `None` ends the
     /// walk, so a provider that answers whole needs no implementation.
-    fn next_asset_list_page(&self, _envelope: &Envelope) -> Option<u32> {
+    ///
+    /// Shared by every paginated walk, because how a provider paginates is a
+    /// property of the provider and not of the list being walked.
+    fn next_page(&self, _envelope: &Envelope) -> Option<u32> {
         None
+    }
+
+    /// Fetches one page of a reference list. A provider that publishes none
+    /// keeps the default and the step does nothing.
+    ///
+    /// Reference lists name what the identifiers on an asset mean. Without them
+    /// a card knows it belongs to league 13 and cannot say Premier League.
+    async fn fetch_reference(&self, _kind: ReferenceKind, _page: u32) -> FetchResult {
+        Err(FetchError::Other(anyhow::anyhow!(
+            "this provider publishes no reference lists"
+        )))
+    }
+
+    fn parse_reference(
+        &self,
+        _kind: ReferenceKind,
+        _envelope: &Envelope,
+    ) -> anyhow::Result<Vec<ReferenceEntity>> {
+        Ok(Vec::new())
+    }
+
+    /// Which reference lists this provider publishes. Empty by default, so the
+    /// step is skipped rather than special cased.
+    fn reference_kinds(&self) -> &'static [ReferenceKind] {
+        &[]
     }
 
     /// Attributes the asset list already carries. A provider that answers the

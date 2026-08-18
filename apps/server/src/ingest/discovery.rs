@@ -182,7 +182,7 @@ pub(crate) async fn maybe_discover(
             }
         }
 
-        match runner.source.next_asset_list_page(&envelope) {
+        match runner.source.next_page(&envelope) {
             // The page must increase. A provider that answers with the page we
             // just read would otherwise spin until the budget died.
             Some(next) if next > page => page = next,
@@ -383,7 +383,7 @@ pub async fn apply_coverage(runner: &Runner<'_>, game: &db::Game) -> Result<()> 
 }
 
 /// True when a slow step has not run inside its cadence.
-async fn is_due(
+pub(crate) async fn is_due(
     runner: &Runner<'_>,
     source: &str,
     step: &str,
