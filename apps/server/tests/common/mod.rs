@@ -756,6 +756,26 @@ pub async fn seed_poll_state_with_interval(
     .bind(failures)
     .execute(pool)
     .await?;
+
+    // The append-only record too, because "this asset was polled at T" means
+    // both. Poll state is overwritten on every poll, so the analytics layer
+    // reads ingest_polls instead: a fixture that wrote only the mutable half
+    // would describe a state the derivations cannot see.
+    if let Some(at) = last_polled_at {
+        // A failure count above zero means the newest read failed, which is what
+        // 'rejected' records.
+        let outcome = if failures > 0 { "rejected" } else { "written" };
+        sqlx::query(
+            "INSERT INTO ingest_polls (asset_id, market_id, polled_at, outcome)
+             VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+        )
+        .bind(asset.0)
+        .bind(market.0)
+        .bind(at)
+        .bind(outcome)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 

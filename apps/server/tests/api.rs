@@ -188,7 +188,9 @@ async fn a_stopped_ledger_makes_health_return_503() {
     let asset = seed_asset(&db.pool, game.id, "Marco Verratti", 84, "base")
         .await
         .unwrap();
-    seed_poll_state(&db.pool, asset, market, 0, Some(Utc::now()))
+    // No recent poll claimed here: the explicit seed_poll below is the record
+    // under test, and a fresh one would hide it.
+    seed_poll_state(&db.pool, asset, market, 0, None)
         .await
         .unwrap();
     // The newest evidence that we looked is older than the stated limit.
@@ -273,7 +275,7 @@ async fn the_staleness_limit_does_not_follow_the_slowest_polling_band() {
     let asset = seed_asset(&db.pool, game.id, "Marco Verratti", 60, "base")
         .await
         .unwrap();
-    seed_poll_state_with_interval(&db.pool, asset, market, 1_209_600, 0, Some(Utc::now()))
+    seed_poll_state_with_interval(&db.pool, asset, market, 1_209_600, 0, None)
         .await
         .unwrap();
     seed_poll(

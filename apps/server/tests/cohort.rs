@@ -4,7 +4,7 @@ mod common;
 
 use chrono::{Duration, Utc};
 use common::*;
-use fc_market::cohort;
+use fc_market::analytics::cohort;
 use fc_market::ids::MarketId;
 
 /// One cohort member. Defaults so a test states only what it is testing.
@@ -46,6 +46,17 @@ async fn seed_member(db: &TestDb, market: MarketId, m: Member<'_>) -> anyhow::Re
         m.price,
         Some(m.min_price),
     )
+    .await?;
+    // We learn a price when we poll for it. The default of now() would make
+    // every seeded price unknown until this instant, which no past question
+    // could then see.
+    sqlx::query(
+        "UPDATE market_observations SET ingested_at = $2
+          WHERE asset_id = $1 AND observed_at = $2",
+    )
+    .bind(asset.0)
+    .bind(at)
+    .execute(&db.pool)
     .await?;
     Ok(())
 }
@@ -96,7 +107,9 @@ async fn cards_group_into_bands_by_rating_and_version() {
     .await
     .unwrap();
 
-    let rows = cohort::snapshot(&db.pool, market).await.unwrap();
+    let rows = cohort::snapshot(&db.pool, market, Utc::now())
+        .await
+        .unwrap();
     let icon_top = rows
         .iter()
         .find(|r| r.version == "icon" && r.rating_band == "90+")
@@ -167,7 +180,7 @@ async fn floored_cards_are_counted_but_kept_out_of_the_median() {
         .unwrap();
     }
 
-    let band = cohort::snapshot(&db.pool, market)
+    let band = cohort::snapshot(&db.pool, market, Utc::now())
         .await
         .unwrap()
         .into_iter()
@@ -217,7 +230,7 @@ async fn a_band_reports_how_stale_its_worst_member_is() {
     .await
     .unwrap();
 
-    let band = cohort::snapshot(&db.pool, market)
+    let band = cohort::snapshot(&db.pool, market, Utc::now())
         .await
         .unwrap()
         .into_iter()
@@ -266,7 +279,7 @@ async fn a_card_we_have_stopped_reading_leaves_the_cohort() {
     .await
     .unwrap();
 
-    let band = cohort::snapshot(&db.pool, market)
+    let band = cohort::snapshot(&db.pool, market, Utc::now())
         .await
         .unwrap()
         .into_iter()
@@ -311,7 +324,7 @@ async fn a_cohort_covers_one_market_only() {
     .await
     .unwrap();
 
-    let ps_band = cohort::snapshot(&db.pool, playstation)
+    let ps_band = cohort::snapshot(&db.pool, playstation, Utc::now())
         .await
         .unwrap()
         .into_iter()
@@ -353,10 +366,135 @@ async fn an_unrated_asset_forms_its_own_band() {
     .await
     .unwrap();
 
-    let rows = cohort::snapshot(&db.pool, market).await.unwrap();
+    let rows = cohort::snapshot(&db.pool, market, Utc::now())
+        .await
+        .unwrap();
     assert!(
         rows.iter().any(|r| r.rating_band == "unrated"),
         "an unrated card must be visible, not folded into under-75: {rows:?}"
+    );
+    db.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Reproducibility
+// ---------------------------------------------------------------------------
+
+/// The reason `as_of` exists at all.
+///
+/// A derivation that reads `now()` answers a different question every time it is
+/// asked, so a claim it made on Tuesday cannot be checked on Friday. Scoring our
+/// own predictions against a moving ranking is marking our own homework.
+#[tokio::test]
+async fn the_same_question_asked_of_a_past_time_gives_the_same_answer() {
+    let db = TestDb::new().await.unwrap();
+    let market = db.market(PS).await.unwrap();
+    let then = Utc::now() - Duration::hours(12);
+
+    seed_member(
+        &db,
+        market,
+        Member {
+            name: "Early",
+            rating: 91,
+            version: "icon",
+            price: 500_000,
+            polled_hours_ago: 24,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let before = cohort::snapshot(&db.pool, market, then).await.unwrap();
+
+    // The world moves on: another card is priced, and priced differently.
+    seed_member(
+        &db,
+        market,
+        Member {
+            name: "Later",
+            rating: 92,
+            version: "icon",
+            price: 2_000_000,
+            polled_hours_ago: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = cohort::snapshot(&db.pool, market, Utc::now())
+        .await
+        .unwrap();
+    let again = cohort::snapshot(&db.pool, market, then).await.unwrap();
+
+    let band = |rows: &[cohort::CohortSnapshot]| {
+        rows.iter()
+            .find(|r| r.rating_band == "90+")
+            .map(|r| (r.members, r.median_price))
+            .expect("the 90+ band")
+    };
+
+    assert_eq!(
+        band(&before),
+        band(&again),
+        "the past must not change when the present does"
+    );
+    assert_ne!(
+        band(&now),
+        band(&again),
+        "and the present must still reflect what has since happened"
+    );
+    db.cleanup().await;
+}
+
+/// A price we imported after the moment in question was not available for a
+/// decision made at that moment. Counting it is hindsight, and it is the subtler
+/// half of reproducibility: the row can be OLDER than as_of and still unknown.
+#[tokio::test]
+async fn a_price_imported_after_the_moment_is_not_used_at_that_moment() {
+    let db = TestDb::new().await.unwrap();
+    let market = db.market(PS).await.unwrap();
+    let game = db.game().await.unwrap();
+    let asset = seed_asset(&db.pool, game.id, "Backfilled", 91, "icon")
+        .await
+        .unwrap();
+    let observed = Utc::now() - Duration::hours(30);
+    seed_poll_state(&db.pool, asset, market, 0, Some(observed))
+        .await
+        .unwrap();
+    seed_observation(
+        &db.pool,
+        asset,
+        market,
+        "test",
+        observed,
+        750_000,
+        Some(200),
+    )
+    .await
+    .unwrap();
+    // Observed 30 hours ago, but only imported a moment ago.
+    sqlx::query("UPDATE market_observations SET ingested_at = now() WHERE asset_id = $1")
+        .bind(asset.0)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let then = cohort::snapshot(&db.pool, market, Utc::now() - Duration::hours(12))
+        .await
+        .unwrap();
+    assert!(
+        then.iter().all(|r| r.rating_band != "90+"),
+        "a price we had not yet imported must not appear in a past answer: {then:?}"
+    );
+
+    let now = cohort::snapshot(&db.pool, market, Utc::now())
+        .await
+        .unwrap();
+    assert!(
+        now.iter().any(|r| r.rating_band == "90+"),
+        "and it must appear once we have it"
     );
     db.cleanup().await;
 }

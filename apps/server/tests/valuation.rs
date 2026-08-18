@@ -4,8 +4,8 @@ mod common;
 
 use chrono::{Duration, Utc};
 use common::*;
+use fc_market::analytics::valuation::{self, ClassValue};
 use fc_market::ids::{MarketId, Platform};
-use fc_market::valuation::{self, ClassValue};
 
 /// A live asset: polled recently, with no failures, holding one price.
 async fn live_card(
@@ -39,7 +39,7 @@ async fn live_card(
 }
 
 async fn value(db: &TestDb, market: MarketId) -> Vec<ClassValue> {
-    valuation::class_median(&db.pool, market, 5_000)
+    valuation::class_median(&db.pool, market, 5_000, Utc::now())
         .await
         .unwrap()
 }
