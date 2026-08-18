@@ -139,3 +139,81 @@ async fn events_are_kept_per_game() {
     );
     db.cleanup().await;
 }
+
+/// A superseding row must belong to the same title as the row it replaces.
+///
+/// The supersedes id arrives from the caller, and the visibility check did not
+/// constrain the superseding row's game. Together those let a row in one title
+/// hide an event in another from every study, permanently and silently.
+#[tokio::test]
+async fn an_event_cannot_be_hidden_by_a_row_from_another_game() {
+    let db = TestDb::new().await.unwrap();
+    let game = db.game().await.unwrap();
+    let (other_game, _) = seed_second_game(&db.pool).await.unwrap();
+
+    let target = events::record(&db.pool, game.id, &drop_at(6))
+        .await
+        .unwrap();
+
+    // The other title tries to supersede this title's event.
+    let mut intruder = drop_at(6);
+    intruder.supersedes = Some(target.id);
+    intruder.name = "From another game".into();
+    let result = events::record(&db.pool, other_game, &intruder).await;
+
+    assert!(
+        result.is_err(),
+        "superseding across titles must be refused outright"
+    );
+
+    let known = events::known_at(&db.pool, game.id, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        known.len(),
+        1,
+        "and the event must still be visible to its own title: {known:?}"
+    );
+    assert_eq!(known[0].id, target.id);
+    db.cleanup().await;
+}
+
+/// The second door.
+///
+/// The write path refuses a cross-title supersede, so the read path's own guard
+/// is never reached in normal use and would go untested. A row inserted directly
+/// stands in for the ways one could arrive anyway: a restore, a manual fix, or a
+/// future caller that skips `record`. Rule 1's history in this codebase is that a
+/// guard installed at one door and not the other is the defect that ships.
+#[tokio::test]
+async fn a_cross_game_superseding_row_cannot_hide_an_event_even_if_it_exists() {
+    let db = TestDb::new().await.unwrap();
+    let game = db.game().await.unwrap();
+    let (other_game, _) = seed_second_game(&db.pool).await.unwrap();
+    let target = events::record(&db.pool, game.id, &drop_at(6))
+        .await
+        .unwrap();
+
+    // Straight into the table, bypassing the write guard entirely.
+    sqlx::query(
+        "INSERT INTO market_events (id, game_id, kind, name, occurred_at, supersedes)
+         VALUES ($1, $2, 'content_drop', 'Smuggled', now(), $3)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(other_game.0)
+    .bind(target.id)
+    .execute(&db.pool)
+    .await
+    .expect("the database itself does not forbid this row");
+
+    let known = events::known_at(&db.pool, game.id, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        known.len(),
+        1,
+        "a row from another title must not hide this title's event: {known:?}"
+    );
+    assert_eq!(known[0].id, target.id);
+    db.cleanup().await;
+}

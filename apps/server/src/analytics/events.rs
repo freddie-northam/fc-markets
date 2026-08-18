@@ -49,12 +49,34 @@ pub struct NewEvent {
 /// `kind` is folded to the canonical shape the database enforces, for the reason
 /// `version` is: a study groups on it, and "TOTW" arriving beside "totw" would
 /// split one series into two without raising anything.
+///
+/// A `supersedes` id arrives from the caller, so it is checked against this game
+/// before it is written. Without that a row in one title could supersede an
+/// event in another, and since a superseded event is hidden from every study,
+/// the hiding would be permanent and silent.
 pub async fn record(pool: &PgPool, game: GameId, event: &NewEvent) -> Result<MarketEvent> {
     let kind = event
         .kind
         .trim()
         .to_lowercase()
         .replace(char::is_whitespace, "_");
+
+    // The supersedes id comes from the caller, so it is checked against this
+    // game before it is written. Without this a row in one title could supersede
+    // an event in another, and because a superseded event is hidden from every
+    // study, that hiding would be permanent and silent.
+    if let Some(superseded) = event.supersedes {
+        let same_game: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM market_events WHERE id = $1 AND game_id = $2)",
+        )
+        .bind(superseded)
+        .bind(game.0)
+        .fetch_one(pool)
+        .await?;
+        if !same_game {
+            anyhow::bail!("an event can only supersede one from the same game");
+        }
+    }
     Ok(sqlx::query_as::<_, MarketEvent>(
         "INSERT INTO market_events
            (id, game_id, kind, name, occurred_at, ended_at, supersedes, note)
@@ -81,7 +103,9 @@ pub async fn record(pool: &PgPool, game: GameId, event: &NewEvent) -> Result<Mar
 /// run on Monday, and counting it is hindsight.
 ///
 /// Superseded rows are excluded, so a corrected time replaces rather than
-/// duplicates, while the row it replaced stays readable.
+/// duplicates, while the row it replaced stays readable. The superseding row
+/// must belong to the same game: the write path refuses anything else, and this
+/// refuses to honour it even if a row got in another way. One door each side.
 pub async fn known_at(
     pool: &PgPool,
     game: GameId,
@@ -94,7 +118,9 @@ pub async fn known_at(
             AND e.recorded_at <= $2
             AND NOT EXISTS (
                 SELECT 1 FROM market_events s
-                 WHERE s.supersedes = e.id AND s.recorded_at <= $2
+                 WHERE s.supersedes = e.id
+                   AND s.game_id = e.game_id
+                   AND s.recorded_at <= $2
             )
           ORDER BY e.occurred_at DESC, e.id",
     )
